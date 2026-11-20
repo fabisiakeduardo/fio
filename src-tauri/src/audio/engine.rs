@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use libpulse_binding::callbacks::ListResult;
 use libpulse_binding::context::{self, Context, FlagSet};
+use libpulse_binding::def;
 use libpulse_binding::context::introspect;
 use libpulse_binding::mainloop::api::MainloopInnerType;
 use libpulse_binding::mainloop::threaded::Mainloop;
@@ -53,6 +54,10 @@ pub enum EngineError {
     NotReady,
     /// An introspection list call reported an error.
     ListFailed,
+    /// `pa_context_load_module` reported failure (`PA_INVALID_INDEX`).
+    LoadFailed,
+    /// `pa_context_unload_module` reported failure.
+    UnloadFailed,
 }
 
 impl fmt::Display for EngineError {
@@ -66,6 +71,8 @@ impl fmt::Display for EngineError {
             Self::ConnectTimeout => "timed out waiting for pulse server",
             Self::NotReady => "pulse context is not connected",
             Self::ListFailed => "pulse introspection query failed",
+            Self::LoadFailed => "pulse module load failed",
+            Self::UnloadFailed => "pulse module unload failed",
         };
         f.write_str(msg)
     }
@@ -301,6 +308,97 @@ impl PulseEngine {
         Ok(state)
     }
 
+    /// Loads a module into the server and returns its module index.
+    ///
+    /// `argument` is a `pactl`-style arg string; [`null_sink_args`] and
+    /// [`loopback_args`] build the strings for the modules Fio manages.
+    /// The index identifies the module to [`Self::unload_module`] and in
+    /// `ActualState::modules` — it is per-session, never persist it.
+    ///
+    /// Same discipline as [`Self::actual_state`]: PA lock → issue → park in
+    /// `mainloop.wait()` → collect. The index callback fires exactly once
+    /// on the mainloop thread — with [`def::INVALID_INDEX`] on failure,
+    /// surfaced here as [`EngineError::LoadFailed`] — then signals `wait`.
+    ///
+    /// # Panics
+    /// Panics if libpulse refuses the request itself (a null operation) —
+    /// in practice only if `name` or `argument` contain interior NULs.
+    pub fn load_module(&self, name: &str, argument: &str) -> Result<u32, EngineError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let pa_lock = PaLock::acquire(&mut inner.mainloop);
+        if inner.context.get_state() != context::State::Ready {
+            drop(pa_lock);
+            return Err(EngineError::NotReady);
+        }
+        let tml = inner.mainloop._inner.get_ptr();
+
+        let result = Arc::new(Mutex::new(None::<u32>));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let op = inner.context.introspect().load_module(name, argument, {
+            let result = Arc::clone(&result);
+            let done = Arc::clone(&done);
+            move |index: u32| {
+                *result.lock().unwrap() = Some(index);
+                op_done(&done, tml);
+            }
+        });
+
+        while !done.load(Ordering::SeqCst) {
+            inner.mainloop.wait();
+        }
+        drop(op);
+        drop(pa_lock);
+
+        let index = result
+            .lock()
+            .unwrap()
+            .expect("load_module callback runs exactly once before done");
+        match index {
+            def::INVALID_INDEX => Err(EngineError::LoadFailed),
+            index => Ok(index),
+        }
+    }
+
+    /// Unloads the module with the given index (from [`Self::load_module`]
+    /// or `ActualState::modules`). Returns [`EngineError::UnloadFailed`]
+    /// when the server reports failure (e.g. unknown index).
+    ///
+    /// Same lock → issue → wait → collect pattern as [`Self::load_module`];
+    /// the success callback fires exactly once on the mainloop thread.
+    pub fn unload_module(&self, index: u32) -> Result<(), EngineError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let pa_lock = PaLock::acquire(&mut inner.mainloop);
+        if inner.context.get_state() != context::State::Ready {
+            drop(pa_lock);
+            return Err(EngineError::NotReady);
+        }
+        let tml = inner.mainloop._inner.get_ptr();
+
+        let ok = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let op = inner.context.introspect().unload_module(index, {
+            let ok = Arc::clone(&ok);
+            let done = Arc::clone(&done);
+            move |success: bool| {
+                ok.store(success, Ordering::SeqCst);
+                op_done(&done, tml);
+            }
+        });
+
+        while !done.load(Ordering::SeqCst) {
+            inner.mainloop.wait();
+        }
+        drop(op);
+        drop(pa_lock);
+
+        match ok.load(Ordering::SeqCst) {
+            true => Ok(()),
+            false => Err(EngineError::UnloadFailed),
+        }
+    }
+
     /// Disconnects the context and stops the mainloop thread.
     ///
     /// Equivalent to letting the engine go out of scope; kept as a named
@@ -382,6 +480,37 @@ fn list_done(
         // thread.
         unsafe { libpulse_sys::pa_threaded_mainloop_signal(tml, 0) };
     }
+}
+
+/// Runs on the PA mainloop thread when a single-shot operation callback
+/// (module load/unload) fires. Flags completion and signals the
+/// `mainloop.wait()` in the caller. See [`list_done`] for why the raw
+/// `pa_threaded_mainloop_signal` call is sound here.
+fn op_done(done: &AtomicBool, tml: *mut libpulse_binding::mainloop::threaded::MainloopInternal) {
+    done.store(true, Ordering::SeqCst);
+    // SAFETY: `tml` is the engine's threaded mainloop, which outlives this
+    // callback — the caller does not return (and engine teardown cannot
+    // proceed) until `done` is set, which happens inside this function.
+    unsafe { libpulse_sys::pa_threaded_mainloop_signal(tml, 0) };
+}
+
+/// `pactl`-style argument string for `module-null-sink`: a virtual sink
+/// named `fio-{slug}` plus its `fio-{slug}-mic` virtual-mic source, both
+/// labelled `{name}` in the UI.
+pub fn null_sink_args(name: &str, slug: &str) -> String {
+    format!(
+        "sink_name=fio-{slug} source_name=fio-{slug}-mic \
+         sink_properties=device.description='{name}' \
+         source_properties=device.description='{name}'"
+    )
+}
+
+/// `pactl`-style argument string for `module-loopback`: forwards audio
+/// captured from `source_name` into `sink_name`. `source_dont_move` and
+/// `sink_dont_move` pin both ends so default-device changes can't drag the
+/// link onto another device.
+pub fn loopback_args(source_name: &str, sink_name: &str) -> String {
+    format!("source={source_name} sink={sink_name} source_dont_move=1 sink_dont_move=1")
 }
 
 /// `true` if a PulseAudio-compatible server answers within
