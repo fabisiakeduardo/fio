@@ -291,12 +291,16 @@ impl Manager {
         }
     }
 
-    /// Creates a route: persists it, then enforces it immediately —
-    /// matching live streams move (AppName rules) or the loopback link
-    /// loads (capture/monitor sources). Unresolvable ends are not
-    /// errors: they surface as drift, same as the startup heal treats
-    /// them.
+    /// Creates a route: validates it, persists it, then enforces it
+    /// immediately — matching live streams move (AppName rules) or the
+    /// loopback link loads (capture/monitor sources). Unresolvable ends
+    /// are not errors: they surface as drift, same as the startup heal
+    /// treats them. Rejects unsafe endpoint names and monitor feedback
+    /// loops — including cycles through other devices (see
+    /// [`validate_route`]).
     pub fn create_route(&self, source: RouteSource, target: RouteTarget) -> Result<Route, String> {
+        let desired = self.desired();
+        validate_route(&desired, &source, &target)?;
         let route = self.with_store(|store| store.add_route(source, target));
         if let (Some(engine), Some(driver)) = (self.engine.as_deref(), self.driver.as_ref())
             && let Ok(actual) = engine.actual_state()
@@ -412,10 +416,15 @@ impl Default for Manager {
 /// - empty / whitespace-only names,
 /// - `'`, which would produce a malformed `device.description='…'` modarg
 ///   (slug sanitization doesn't cover the display name),
+/// - control characters — an interior NUL aborts the process at the FFI
+///   `CString` boundary (`panic = "abort"`),
 /// - names that slugify to nothing ("!!!" → `fio-` is no sink name).
 fn validate_device_name(name: &str) -> Result<(), String> {
     if name.trim().is_empty() {
         return Err("device name must not be empty".to_string());
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return Err("device name must not contain control characters".to_string());
     }
     if name.contains('\'') {
         return Err("device name must not contain a single quote (')".to_string());
@@ -424,6 +433,104 @@ fn validate_device_name(name: &str) -> Result<(), String> {
         return Err("device name must contain at least one letter or digit".to_string());
     }
     Ok(())
+}
+
+/// Route validation for `create_route` — kept pure so the rules are
+/// testable without a server. Rejects:
+/// - `CaptureDevice`/`PhysicalSink` names that would corrupt the
+///   `module-loopback` arg string or its whole-token matching
+///   ([`validate_link_endpoint`]),
+/// - empty / control-char `AppName` rules,
+/// - a `VirtualMonitor(id) → VirtualDevice(id)` self-feed, and
+/// - any route whose monitor→device edge would close a feedback cycle
+///   (`A.mon→B` + `B.mon→A` is two `module-loopback`s amplifying each
+///   other to full-scale clipping).
+fn validate_route(
+    desired: &PersistedState,
+    source: &RouteSource,
+    target: &RouteTarget,
+) -> Result<(), String> {
+    match source {
+        RouteSource::AppName(name) => validate_app_rule(name)?,
+        RouteSource::CaptureDevice(name) => validate_link_endpoint(name)?,
+        RouteSource::VirtualMonitor(_) => {}
+    }
+    if let RouteTarget::PhysicalSink(name) = target {
+        validate_link_endpoint(name)?;
+    }
+    if let (RouteSource::VirtualMonitor(a), RouteTarget::VirtualDevice(b)) = (source, target) {
+        if a == b {
+            return Err("a device's monitor cannot feed the device itself".to_string());
+        }
+        // Adding a→b closes a loop exactly when b already reaches a over
+        // the persisted monitor→device edges.
+        if monitor_path_exists(desired, *b, *a) {
+            return Err(
+                "route would close a monitor feedback loop between virtual devices".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Link endpoint names (`CaptureDevice`, `PhysicalSink`) are embedded
+/// verbatim in the `module-loopback` arg string and matched back as
+/// whole whitespace-separated tokens in `link_present`/`unload_loopback`
+/// — whitespace or `'`/`=` would corrupt the `name=value` token and
+/// orphan the loaded link, while control characters (NUL) panic the FFI
+/// `CString` conversion — fatal under `panic = "abort"`.
+fn validate_link_endpoint(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("route endpoint name must not be empty".to_string());
+    }
+    if name
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '\'' | '='))
+    {
+        return Err(
+            "route endpoint name must not contain whitespace, ', = or control characters"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// An `AppName` rule is exact-matched against stream properties — never
+/// interpolated into module args — so spaces and `'` are legitimate.
+/// Only emptiness and control characters are rejected.
+fn validate_app_rule(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("app rule name must not be empty".to_string());
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return Err("app rule name must not contain control characters".to_string());
+    }
+    Ok(())
+}
+
+/// Is `to` reachable from `from` over the persisted
+/// `VirtualMonitor → VirtualDevice` edges? A candidate edge `a→b` would
+/// complete a feedback cycle exactly when `b` already reaches `a`.
+fn monitor_path_exists(desired: &PersistedState, from: Uuid, to: Uuid) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![from];
+    while let Some(id) = stack.pop() {
+        if id == to {
+            return true;
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        stack.extend(desired.routes.iter().filter_map(|r| {
+            match (&r.source, &r.target) {
+                (RouteSource::VirtualMonitor(a), RouteTarget::VirtualDevice(b)) if *a == id => {
+                    Some(*b)
+                }
+                _ => None,
+            }
+        }));
+    }
+    false
 }
 
 /// Where each stream stranded on a deleted device's sink goes:
@@ -629,5 +736,221 @@ mod tests {
         assert!(validate_device_name("!!!").is_err());
         assert!(validate_device_name("Game Mic").is_ok());
         assert!(validate_device_name("\"quoted\"").is_ok()); // only ' is dangerous
+    }
+
+    #[test]
+    fn create_device_rejects_control_chars() {
+        // An interior NUL aborts the process at the FFI CString boundary
+        // under `panic = "abort"`; other control chars are just as hostile.
+        assert!(validate_device_name("dev\u{0}ice").is_err());
+        assert!(validate_device_name("dev\u{7}bell").is_err());
+        assert!(validate_device_name("dev\tice").is_err());
+        assert!(validate_device_name("dev\nice").is_err());
+    }
+
+    fn mk_vdev(slug: &str) -> VirtualDevice {
+        VirtualDevice {
+            id: Uuid::new_v4(),
+            name: slug.to_string(),
+            slug: slug.to_string(),
+        }
+    }
+
+    fn mk_route(source: RouteSource, target: RouteTarget) -> Route {
+        Route {
+            id: Uuid::new_v4(),
+            source,
+            target,
+        }
+    }
+
+    fn desired_with(devices: Vec<VirtualDevice>, routes: Vec<Route>) -> PersistedState {
+        PersistedState {
+            version: 1,
+            devices,
+            routes,
+            seen_apps: vec![],
+        }
+    }
+
+    #[test]
+    fn create_route_rejects_monitor_self_feed() {
+        let a = mk_vdev("a");
+        let desired = desired_with(vec![a.clone()], vec![]);
+        // VirtualMonitor(a) -> VirtualDevice(a): loopback of a device into
+        // itself — instant feedback. The UI blocks this; the backend must too.
+        assert!(
+            validate_route(
+                &desired,
+                &RouteSource::VirtualMonitor(a.id),
+                &RouteTarget::VirtualDevice(a.id),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn create_route_rejects_two_device_monitor_cycle() {
+        let a = mk_vdev("a");
+        let b = mk_vdev("b");
+        let desired = desired_with(
+            vec![a.clone(), b.clone()],
+            vec![mk_route(
+                RouteSource::VirtualMonitor(a.id),
+                RouteTarget::VirtualDevice(b.id),
+            )],
+        );
+        // A.mon -> B already persisted: adding B.mon -> A closes the loop.
+        assert!(
+            validate_route(
+                &desired,
+                &RouteSource::VirtualMonitor(b.id),
+                &RouteTarget::VirtualDevice(a.id),
+            )
+            .is_err()
+        );
+        // The existing forward edge itself is fine.
+        assert!(
+            validate_route(
+                &desired,
+                &RouteSource::VirtualMonitor(a.id),
+                &RouteTarget::VirtualDevice(b.id),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn create_route_rejects_longer_monitor_cycle() {
+        let a = mk_vdev("a");
+        let b = mk_vdev("b");
+        let c = mk_vdev("c");
+        let desired = desired_with(
+            vec![a.clone(), b.clone(), c.clone()],
+            vec![
+                mk_route(
+                    RouteSource::VirtualMonitor(a.id),
+                    RouteTarget::VirtualDevice(b.id),
+                ),
+                mk_route(
+                    RouteSource::VirtualMonitor(b.id),
+                    RouteTarget::VirtualDevice(c.id),
+                ),
+            ],
+        );
+        // A.mon->B and B.mon->C exist: C.mon->A closes A->B->C->A.
+        assert!(
+            validate_route(
+                &desired,
+                &RouteSource::VirtualMonitor(c.id),
+                &RouteTarget::VirtualDevice(a.id),
+            )
+            .is_err()
+        );
+        // A.mon->C extends the chain without closing it — allowed.
+        assert!(
+            validate_route(
+                &desired,
+                &RouteSource::VirtualMonitor(a.id),
+                &RouteTarget::VirtualDevice(c.id),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn create_route_allows_monitor_to_physical_sink() {
+        let a = mk_vdev("a");
+        let desired = desired_with(vec![a.clone()], vec![]);
+        // Monitor feeds to real hardware can't cycle — they're leaves.
+        assert!(
+            validate_route(
+                &desired,
+                &RouteSource::VirtualMonitor(a.id),
+                &RouteTarget::PhysicalSink("alsa_out".to_string()),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn create_route_rejects_unsafe_link_endpoint_names() {
+        let a = mk_vdev("a");
+        let desired = desired_with(vec![a.clone()], vec![]);
+        for bad in [
+            "",
+            "has space",
+            "quo'te",
+            "eq=ual",
+            "nu\u{0}l",
+            "tab\tbed",
+            "new\nline",
+            "trailing ",
+            " leading",
+        ] {
+            assert!(
+                validate_route(
+                    &desired,
+                    &RouteSource::CaptureDevice(bad.to_string()),
+                    &RouteTarget::VirtualDevice(a.id),
+                )
+                .is_err(),
+                "CaptureDevice({bad:?}) should be rejected"
+            );
+            assert!(
+                validate_route(
+                    &desired,
+                    &RouteSource::AppName("app".to_string()),
+                    &RouteTarget::PhysicalSink(bad.to_string()),
+                )
+                .is_err(),
+                "PhysicalSink({bad:?}) should be rejected"
+            );
+        }
+        // Normal pulse names pass.
+        let ok_name = "alsa_output.pci-0000_00_1f.3.analog-stereo";
+        assert!(
+            validate_route(
+                &desired,
+                &RouteSource::CaptureDevice(ok_name.to_string()),
+                &RouteTarget::VirtualDevice(a.id),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_route(
+                &desired,
+                &RouteSource::AppName("app".to_string()),
+                &RouteTarget::PhysicalSink(ok_name.to_string()),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn create_route_appname_allows_spaces_rejects_control() {
+        let a = mk_vdev("a");
+        let desired = desired_with(vec![a.clone()], vec![]);
+        // AppName rules are exact-matched against stream properties, never
+        // interpolated into module args — spaces are legitimate.
+        assert!(
+            validate_route(
+                &desired,
+                &RouteSource::AppName("Music Player".to_string()),
+                &RouteTarget::VirtualDevice(a.id),
+            )
+            .is_ok()
+        );
+        for bad in ["", "   ", "nu\u{0}l", "bell\u{7}"] {
+            assert!(
+                validate_route(
+                    &desired,
+                    &RouteSource::AppName(bad.to_string()),
+                    &RouteTarget::VirtualDevice(a.id),
+                )
+                .is_err(),
+                "AppName({bad:?}) should be rejected"
+            );
+        }
     }
 }
