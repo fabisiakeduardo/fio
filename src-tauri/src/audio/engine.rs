@@ -80,18 +80,57 @@ struct Inner {
     mainloop: Mainloop,
 }
 
-// SAFETY: `Inner` is only ever touched behind `PulseEngine`'s `Mutex`.
+// SAFETY: `Inner` is only ever touched behind `PulseEngine`'s `Mutex`, or in
+// `PulseEngine::drop` once no other reference can exist.
 // - `pa_context_*` calls happen either on the constructing thread (before the
 //   object is shared) or with the PA mainloop lock held, which is exactly the
 //   calling convention `pa_threaded_mainloop` exists to provide.
 // - `pa_threaded_mainloop_*` calls (`lock`/`unlock`/`wait`/`signal`/`stop`)
 //   are documented as callable from any thread.
+// - Teardown is only performed by `PulseEngine::drop`, which disconnects the
+//   context under the PA lock and stops the loop thread before `Inner`'s
+//   fields drop — so the PA thread never outlives the objects it dispatches.
 // - Callbacks execute on the PA thread but never touch the `Rc`s inside
 //   `Mainloop`/`Context`: shared state is `Arc`-based, and the only mainloop
 //   handle they use is the raw `pa_threaded_mainloop` pointer, passed to the
 //   `pa_threaded_mainloop_signal` FFI function — a plain C call with no Rust
 //   aliasing.
 unsafe impl Send for Inner {}
+
+/// RAII guard for the PA threaded-mainloop lock.
+///
+/// The binding's `Mainloop::lock`/`unlock` take `&mut self`, but a `&mut`
+/// held across `wait()` would block the reborrow `wait` itself needs — so
+/// the guard keeps the raw `pa_threaded_mainloop` pointer and calls the C
+/// functions directly (the same functions those methods wrap, obtainable via
+/// the public `MainloopInnerType::get_ptr`).
+///
+/// Its real purpose is panic safety: if anything unwinds while the PA lock
+/// is held, `Drop` still runs `pa_threaded_mainloop_unlock`. Without that, a
+/// panic inside the locked section would leak the C mutex and deadlock
+/// `PulseEngine::drop` running later on another thread.
+struct PaLock(*mut libpulse_binding::mainloop::threaded::MainloopInternal);
+
+impl PaLock {
+    fn acquire(mainloop: &mut Mainloop) -> Self {
+        let tml = mainloop._inner.get_ptr();
+        // SAFETY: `tml` is a live threaded mainloop; `lock` may be called
+        // from any thread except the loop thread itself (never us — callers
+        // are outside callbacks). The pointer stays valid until the matching
+        // `unlock` in `Drop`, which precedes any `stop`/`free` on this
+        // mainloop by construction (engine teardown happens after this guard
+        // is dropped).
+        unsafe { libpulse_sys::pa_threaded_mainloop_lock(tml) };
+        Self(tml)
+    }
+}
+
+impl Drop for PaLock {
+    fn drop(&mut self) {
+        // SAFETY: paired with `acquire` — unlocks the lock this guard took.
+        unsafe { libpulse_sys::pa_threaded_mainloop_unlock(self.0) };
+    }
+}
 
 /// One live connection to the PulseAudio/PipeWire-pulse server.
 ///
@@ -117,9 +156,10 @@ impl PulseEngine {
 
         let deadline = Instant::now() + CONNECT_TIMEOUT;
         if let Err(e) = wait_ready(&mut mainloop, &context, deadline) {
-            mainloop.lock();
-            context.disconnect();
-            mainloop.unlock();
+            {
+                let _pa_lock = PaLock::acquire(&mut mainloop);
+                context.disconnect();
+            }
             mainloop.stop();
             return Err(e);
         }
@@ -144,9 +184,13 @@ impl PulseEngine {
         let pending = Arc::new(AtomicUsize::new(SNAPSHOT_OPS));
         let failed = Arc::new(AtomicBool::new(false));
 
-        inner.mainloop.lock();
+        // RAII PA lock: `wait()` below re-acquires the lock internally, and
+        // the guard's `Drop` guarantees `pa_threaded_mainloop_unlock` runs if
+        // a panic unwinds out of this section — otherwise the C mutex would
+        // stay held and `PulseEngine::drop` on another thread would deadlock.
+        let pa_lock = PaLock::acquire(&mut inner.mainloop);
         if inner.context.get_state() != context::State::Ready {
-            inner.mainloop.unlock();
+            drop(pa_lock);
             return Err(EngineError::NotReady);
         }
 
@@ -245,7 +289,7 @@ impl PulseEngine {
         drop(op_sources);
         drop(op_inputs);
         drop(op_modules);
-        inner.mainloop.unlock();
+        drop(pa_lock);
 
         if failed.load(Ordering::SeqCst) {
             return Err(EngineError::ListFailed);
@@ -258,13 +302,37 @@ impl PulseEngine {
     }
 
     /// Disconnects the context and stops the mainloop thread.
+    ///
+    /// Equivalent to letting the engine go out of scope; kept as a named
+    /// method because the intent reads better at call sites. The actual
+    /// teardown happens in [`Drop::drop`] — see there for why it cannot be
+    /// skipped.
     pub fn shutdown(self) {
-        let mut inner = self.inner.into_inner().unwrap_or_else(|e| e.into_inner());
-        inner.mainloop.lock();
-        inner.context.disconnect();
-        inner.mainloop.unlock();
+        // `Drop::drop` performs lock → disconnect → unlock → stop.
+    }
+}
+
+impl Drop for PulseEngine {
+    /// Tears the connection down in the only safe order: hold the PA lock,
+    /// `pa_context_disconnect`, release the lock, then `pa_threaded_mainloop_stop`
+    /// to join the event-loop thread. Only after that may `Inner`'s fields
+    /// drop (`context` first — a `pa_context_unref` while the dispatch thread
+    /// is still running would race live events, which is exactly what this
+    /// ordering prevents; `mainloop` last frees the joined mainloop object).
+    ///
+    /// This runs for every teardown path — `shutdown`, `Drop` on managed
+    /// state removal, and panic unwinding — so no caller can leave the PA
+    /// thread running into an unref.
+    fn drop(&mut self) {
+        // `get_mut` cannot block (unique ownership) but reports the poison
+        // flag; recover the contents anyway — the C handles are still valid
+        // and teardown must still happen.
+        let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
+        {
+            let _pa_lock = PaLock::acquire(&mut inner.mainloop);
+            inner.context.disconnect();
+        }
         inner.mainloop.stop();
-        // `inner` drops here: context first (field order), then mainloop.
     }
 }
 
