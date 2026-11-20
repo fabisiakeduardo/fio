@@ -20,7 +20,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::audio::{ActualState, EngineError, PulseEngine, PulseEvent};
-use crate::model::Store;
+use crate::model::{PersistedState, Store};
 
 use super::{Action, Drift, detect_drift, plan_new_stream, plan_startup, rule_key};
 
@@ -117,6 +117,39 @@ impl Driver {
             .unwrap_or_else(|e| e.into_inner())
             .rescues
             .remove(&stream_index)
+    }
+
+    /// A snapshot of the whole stream→previous-sink rescue map — the
+    /// delete flow resolves every stranded stream's target in one pass
+    /// rather than taking entries one by one.
+    pub fn rescues(&self) -> HashMap<u32, String> {
+        self.shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rescues
+            .clone()
+    }
+
+    /// Runs `f` against the store under the shared lock — the command
+    /// layer's mutation/read path. Critical sections stay brief; `f` must
+    /// never call back into the engine (the event loop applies actions
+    /// only after releasing the lock).
+    pub fn with_store<R>(&self, f: impl FnOnce(&mut Store) -> R) -> R {
+        let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut shared.store)
+    }
+
+    /// A clone of the persisted desired state (devices, routes, seen
+    /// apps) — what `ui_state` reports and plans run against.
+    pub fn desired(&self) -> PersistedState {
+        self.with_store(|store| store.state().clone())
+    }
+
+    /// Recomputes drift from a fresh snapshot right now. Called after
+    /// command-path mutations so the UI's drift list reflects them
+    /// immediately instead of on the next event tick.
+    pub fn recheck_drift(&self) {
+        update_drift(&self.engine, &self.shared);
     }
 
     /// The launch-time heal: plan against one snapshot, apply in order.

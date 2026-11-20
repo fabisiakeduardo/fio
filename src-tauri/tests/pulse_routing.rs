@@ -3,98 +3,19 @@
 //! it appears, driven by the driver's `NewSinkInput` event path — not by
 //! any test-side move call.
 
-use std::process::{Child, Command, Stdio};
+mod common;
+
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use fio_lib::audio::{PulseEngine, pulse_available};
 use fio_lib::model::{RouteSource, RouteTarget, Store};
 use fio_lib::reconcile::Driver;
 use uuid::Uuid;
 
-const TIMEOUT: Duration = Duration::from_secs(5);
-const POLL: Duration = Duration::from_millis(50);
+use common::{Pacat, UnloadNullSink, wait_for};
+
 /// The null-sink `sink_name` the test's virtual device gets on the server.
 const SINK_NAME: &str = "fio-route-test";
-
-/// Polls `f` until it yields `Some` or [`TIMEOUT`] elapses, then panics —
-/// a hanging test is worse than a loud failure.
-fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        if let Some(v) = f() {
-            return v;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(POLL);
-    }
-}
-
-/// A spawned `pacat` process that is killed and reaped on drop, so a
-/// failed assertion can't leave a silent stream playing in the server.
-struct Pacat(Option<Child>);
-
-impl Pacat {
-    fn spawn() -> Self {
-        let child = Command::new("pacat")
-            .args([
-                "--playback",
-                "--format=s16le",
-                "--rate=48000",
-                "--channels=2",
-                "/dev/zero",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("pacat is installed (part of libpulse)");
-        Self(Some(child))
-    }
-
-    /// Kill the current stream and start a fresh one — the new sink-input
-    /// is what the driver must see and route.
-    fn restart(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        *self = Self::spawn();
-    }
-}
-
-impl Drop for Pacat {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-/// Unloads every `module-null-sink` carrying `sink_name={SINK_NAME}` on
-/// drop — looked up *then*, so a module loaded shortly before a panic is
-/// still reaped. Holds the engine `Arc` so the unload always lands on a
-/// live connection. Declare before `driver`: locals drop in reverse order,
-/// so the driver's event thread is joined before this runs.
-struct UnloadOnDrop {
-    engine: Arc<PulseEngine>,
-}
-
-impl Drop for UnloadOnDrop {
-    fn drop(&mut self) {
-        let want = format!("sink_name={SINK_NAME}");
-        let Ok(state) = self.engine.actual_state() else {
-            return;
-        };
-        for module in state.modules.iter().filter(|m| {
-            m.name == "module-null-sink"
-                && m.argument.as_deref().is_some_and(|a| a.contains(&want))
-        }) {
-            let _ = self.engine.unload_module(module.index);
-        }
-    }
-}
 
 #[test]
 fn new_stream_gets_routed_by_rule() {
@@ -146,8 +67,9 @@ fn new_stream_gets_routed_by_rule() {
 
     // Reaps the null-sink module on success AND on panic — declared before
     // `driver` so it drops after the event thread is joined.
-    let unload = UnloadOnDrop {
+    let unload = UnloadNullSink {
         engine: Arc::clone(&engine),
+        sink_name: SINK_NAME.to_string(),
     };
     let driver = Driver::new(store, Arc::clone(&engine));
 

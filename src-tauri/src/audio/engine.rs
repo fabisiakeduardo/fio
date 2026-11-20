@@ -151,6 +151,15 @@ impl Drop for PaLock {
     }
 }
 
+/// Server-wide defaults — the names of the current default sink and
+/// default source. The device-delete flow needs the default sink as its
+/// rescue fallback; the UI shows the default source.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerDefaults {
+    pub default_sink: Option<String>,
+    pub default_source: Option<String>,
+}
+
 /// A server event forwarded over the channel from [`PulseEngine::subscribe`],
 /// distilled from the subscribe callback's (facility, operation, index)
 /// triple to the cases the driver acts on.
@@ -524,6 +533,42 @@ impl PulseEngine {
             true => Ok(()),
             false => Err(EngineError::MoveFailed),
         }
+    }
+
+    /// The server's current default sink and source names.
+    ///
+    /// `get_server_info`'s callback fires exactly once on the mainloop
+    /// thread — same lock → issue → wait → collect pattern as
+    /// [`Self::load_module`].
+    pub fn server_defaults(&self) -> Result<ServerDefaults, EngineError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let pa_lock = PaLock::acquire(&mut inner.mainloop);
+        if inner.context.get_state() != context::State::Ready {
+            drop(pa_lock);
+            return Err(EngineError::NotReady);
+        }
+        let tml = inner.mainloop._inner.get_ptr();
+
+        let info = Arc::new(Mutex::new(None::<ServerDefaults>));
+        let done = Arc::new(AtomicBool::new(false));
+        let op = inner.context.introspect().get_server_info({
+            let info = Arc::clone(&info);
+            let done = Arc::clone(&done);
+            move |i: &introspect::ServerInfo| {
+                *info.lock().unwrap() = Some(ServerDefaults {
+                    default_sink: i.default_sink_name.as_deref().map(str::to_owned),
+                    default_source: i.default_source_name.as_deref().map(str::to_owned),
+                });
+                op_done(&done, tml);
+            }
+        });
+        while !done.load(Ordering::SeqCst) {
+            inner.mainloop.wait();
+        }
+        drop(op);
+        drop(pa_lock);
+
+        info.lock().unwrap().take().ok_or(EngineError::ListFailed)
     }
 
     /// Makes `name` the server's default source (the "use as default mic"

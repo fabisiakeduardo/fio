@@ -4,8 +4,10 @@
 //! `Introspector` list calls, converted to owned `String`s so the results can
 //! leave the callback context and cross thread boundaries freely.
 
+use serde::Serialize;
+
 /// A sink known to the server (physical output or virtual device).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SinkInfo {
     /// Server-assigned index. Per-session only — never persist.
     pub index: u32,
@@ -18,7 +20,7 @@ pub struct SinkInfo {
 }
 
 /// A source known to the server (physical input or a sink's monitor).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceInfo {
     /// Server-assigned index. Per-session only — never persist.
     pub index: u32,
@@ -35,7 +37,7 @@ pub struct SourceInfo {
 }
 
 /// A playback stream (`sink-input`) — one app currently producing audio.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamInfo {
     /// Server-assigned index. Per-session only — never persist.
     pub index: u32,
@@ -48,7 +50,7 @@ pub struct StreamInfo {
 }
 
 /// A module loaded in the server (`module-null-sink`, `module-loopback`, …).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModuleInfo {
     /// Server-assigned index. Per-session only — never persist.
     pub index: u32,
@@ -62,7 +64,7 @@ pub struct ModuleInfo {
 
 /// What the server actually has, right now — the "actual" side of the
 /// desired-vs-actual reconcile.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ActualState {
     pub sinks: Vec<SinkInfo>,
     pub sources: Vec<SourceInfo>,

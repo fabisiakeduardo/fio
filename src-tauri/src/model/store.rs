@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use super::route::{Route, RouteSource, RouteTarget};
-use super::state::{load_state, save_state, slugify, PersistedState, VirtualDevice};
+use super::state::{PersistedState, VirtualDevice, load_state, save_state, slugify};
 
 /// Maximum number of recently-seen app names retained in `seen_apps`.
 const SEEN_APPS_MAX: usize = 50;
@@ -38,14 +38,17 @@ impl Store {
         device
     }
 
-    /// Remove the device with `id`; also drops routes targeting it.
+    /// Remove the device with `id`; also drops routes targeting it AND
+    /// routes sourcing from its monitor — a `VirtualMonitor` source left
+    /// behind would dangle exactly like a `VirtualDevice` target.
     /// Returns the removed device, or `None` if not found.
     pub fn remove_device(&mut self, id: Uuid) -> Option<VirtualDevice> {
         let pos = self.state.devices.iter().position(|d| d.id == id)?;
         let device = self.state.devices.remove(pos);
-        self.state
-            .routes
-            .retain(|r| r.target != RouteTarget::VirtualDevice(id));
+        self.state.routes.retain(|r| {
+            r.target != RouteTarget::VirtualDevice(id)
+                && r.source != RouteSource::VirtualMonitor(id)
+        });
         self.persist();
         Some(device)
     }
@@ -107,10 +110,7 @@ impl Store {
 
     fn persist(&self) {
         if let Err(e) = save_state(&self.path, &self.state) {
-            eprintln!(
-                "fio: failed to save state to {}: {e}",
-                self.path.display()
-            );
+            eprintln!("fio: failed to save state to {}: {e}", self.path.display());
         }
     }
 }
@@ -174,6 +174,12 @@ mod tests {
             RouteSource::AppName("game".to_string()),
             RouteTarget::VirtualDevice(device.id),
         );
+        // A route sourcing FROM the device's monitor dangles just as hard
+        // as one targeting it — removal drops both.
+        let doomed_source = store.add_route(
+            RouteSource::VirtualMonitor(device.id),
+            RouteTarget::PhysicalSink("alsa_out".to_string()),
+        );
         let kept = store.add_route(
             RouteSource::AppName("music".to_string()),
             RouteTarget::VirtualDevice(other.id),
@@ -182,6 +188,13 @@ mod tests {
         let removed = store.remove_device(device.id);
         assert_eq!(removed.as_ref(), Some(&device));
         assert!(store.state().routes.iter().all(|r| r.id != doomed.id));
+        assert!(
+            store
+                .state()
+                .routes
+                .iter()
+                .all(|r| r.id != doomed_source.id)
+        );
         assert!(store.state().routes.iter().any(|r| r.id == kept.id));
 
         // Removal is persisted too.

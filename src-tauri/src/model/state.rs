@@ -1,5 +1,5 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -57,16 +57,41 @@ pub fn slugify(name: &str) -> String {
 }
 
 /// Load persisted state; missing file => default `{ version: 1, .. }`.
+/// A file that exists but doesn't parse is renamed to `<name>.bak` —
+/// keeping it would re-warn on every launch while the user edits it by
+/// hand — and default state is returned.
 pub fn load_state(path: &Path) -> PersistedState {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return PersistedState::default();
     };
-    serde_json::from_str(&contents).unwrap_or_default()
+    match serde_json::from_str(&contents) {
+        Ok(state) => state,
+        Err(e) => {
+            eprintln!(
+                "fio: corrupt state file {} ({e}); resetting to defaults",
+                path.display()
+            );
+            let mut bak = path.as_os_str().to_owned();
+            bak.push(".bak");
+            let _ = std::fs::rename(path, PathBuf::from(bak));
+            PersistedState::default()
+        }
+    }
 }
 
+/// Persist state to `path`, creating the parent directory if needed.
+/// Writes go to a sibling `<name>.tmp` renamed over the target — a crash
+/// mid-write can't leave a truncated `state.json`.
 pub fn save_state(path: &Path, s: &PersistedState) -> io::Result<()> {
     let json = serde_json::to_string_pretty(s)?;
-    std::fs::write(path, json)
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
@@ -116,5 +141,48 @@ mod tests {
         assert!(loaded.devices.is_empty());
         assert!(loaded.routes.is_empty());
         assert!(loaded.seen_apps.is_empty());
+    }
+
+    #[test]
+    fn load_corrupt_resets_and_preserves_bak() {
+        let path = temp_path("corrupt");
+        std::fs::write(&path, "{ not json").unwrap();
+
+        let loaded = load_state(&path);
+
+        assert_eq!(loaded, PersistedState::default());
+        // The corrupt file is preserved aside for debugging, and the load
+        // path is clear so the next save starts fresh.
+        assert!(!path.exists());
+        let mut bak = path.as_os_str().to_owned();
+        bak.push(".bak");
+        let bak = PathBuf::from(bak);
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "{ not json");
+
+        let _ = std::fs::remove_file(&bak);
+    }
+
+    #[test]
+    fn save_creates_missing_parent_dirs() {
+        let dir = temp_path("nested");
+        let path = dir.join("deep").join("state.json");
+        save_state(&path, &PersistedState::default()).expect("save_state failed");
+
+        assert!(path.exists());
+        assert_eq!(load_state(&path), PersistedState::default());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_leaves_no_tmp_file() {
+        let path = temp_path("atomic");
+        save_state(&path, &PersistedState::default()).expect("save_state failed");
+
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        assert!(!PathBuf::from(tmp).exists());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -22,10 +22,11 @@
 //!   [`ModuleInfo`]'s argument carries both the resolved `source=` and
 //!   `sink=` values.
 
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::audio::{ActualState, StreamInfo, loopback_args, null_sink_args};
-use crate::model::{PersistedState, RouteSource, RouteTarget, VirtualDevice};
+use crate::model::{PersistedState, Route, RouteSource, RouteTarget, VirtualDevice};
 
 /// Something the executor can do to bring actual state closer to desired.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +49,7 @@ pub enum Action {
 
 /// Desired state missing from actual state that reconcile reports rather
 /// than silently fixes — enforcement never fights the user mid-session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Drift {
     /// Our `fio-{slug}` sink is absent from [`ActualState`] (e.g. an
     /// external `pactl unload-module`).
@@ -163,10 +164,10 @@ fn plan_stream_move(
         .iter()
         .find(|r| matches!(&r.source, RouteSource::AppName(app) if app.as_str() == key))?;
     let sink_name = resolve(&route.target)?;
-    if let Some(sink) = actual.sinks.iter().find(|s| s.name == sink_name) {
-        if stream.sink == sink.index {
-            return None;
-        }
+    if let Some(sink) = actual.sinks.iter().find(|s| s.name == sink_name)
+        && stream.sink == sink.index
+    {
+        return None;
     }
     Some(Action::MoveStream {
         stream_index: stream.index,
@@ -251,6 +252,18 @@ fn resolve_target(
     actual.sinks.iter().any(|s| s.name == name).then_some(name)
 }
 
+/// The `(source_name, sink_name)` a link route's `module-loopback`
+/// instance carries, resolved purely from desired state. `None` for
+/// `AppName` rules (no link) and for references to deleted devices.
+/// Used by the command layer to load a route's link on creation and to
+/// find the matching instance on `delete_route`.
+pub fn link_names(desired: &PersistedState, route: &Route) -> Option<(String, String)> {
+    Some((
+        link_source_name(desired, &route.source)?,
+        target_name(desired, &route.target)?,
+    ))
+}
+
 /// The source name a link route captures from, computable purely from
 /// desired state. `None` for `AppName` rules (no link) and for
 /// `VirtualMonitor` ids referencing a deleted device.
@@ -269,7 +282,7 @@ fn link_source_name(desired: &PersistedState, source: &RouteSource) -> Option<St
 /// Is a `module-loopback` carrying this exact `source=`+`sink=` pair
 /// loaded? Argument tokens are compared whole — `split_whitespace`
 /// keeps `source=alsa_in` from matching `source=alsa_in_extra`.
-fn link_present(actual: &ActualState, source: &str, sink: &str) -> bool {
+pub fn link_present(actual: &ActualState, source: &str, sink: &str) -> bool {
     let want_source = format!("source={source}");
     let want_sink = format!("sink={sink}");
     actual.modules.iter().any(|m| {
