@@ -9,7 +9,7 @@ use super::route::Route;
 /// A user-created virtual audio device.
 ///
 /// `slug` is the module-safe name WITHOUT the "fio-" prefix;
-/// sink name = `format!("fio-{slug}")`, source = `format!("fio-{slug}-mic")`.
+/// sink name = `format!("fio-{slug}")`, source = `format!("fio-{slug}.monitor")`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualDevice {
     pub id: Uuid,

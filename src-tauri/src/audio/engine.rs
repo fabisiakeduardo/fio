@@ -495,8 +495,10 @@ fn op_done(done: &AtomicBool, tml: *mut libpulse_binding::mainloop::threaded::Ma
 }
 
 /// `pactl`-style argument string for `module-null-sink`: a virtual sink
-/// named `fio-{slug}` plus its `fio-{slug}-mic` virtual-mic source, both
-/// labelled `{name}` in the UI.
+/// named `fio-{slug}`, labelled `{name}` in the UI. The pinned
+/// `source_name=fio-{slug}-mic` arg is aspirational — pipewire-pulse
+/// ignores it; the device's mic end is the sink's monitor source, which
+/// resolves to `fio-{slug}.monitor`.
 pub fn null_sink_args(name: &str, slug: &str) -> String {
     format!(
         "sink_name=fio-{slug} source_name=fio-{slug}-mic \
