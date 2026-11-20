@@ -11,3 +11,8 @@ vite.config.ts.timestamp-*
 
 # SDD scratch space
 /.superpowers/
+
+# makepkg artifacts (in-repo PKGBUILD builds)
+/pkg/
+/src/fio/
+*.pkg.tar.zst

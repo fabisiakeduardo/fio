@@ -2,7 +2,7 @@
 name = "fio"
 version = "0.1.0"
 description = "Virtual audio patchbay for PipeWire/PulseAudio — Loopback for Linux"
-authors = ["Eduardo"]
+authors = ["Eduardo Fabisiak <fabisiakeduardo@users.noreply.github.com>"]
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

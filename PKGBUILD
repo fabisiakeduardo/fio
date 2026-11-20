@@ -1,4 +1,4 @@
-# Maintainer: Eduardo <eduardo@localhost>
+# Maintainer: Eduardo Fabisiak <fabisiakeduardo@users.noreply.github.com>
 pkgname=fio
 pkgver=0.1.0
 pkgrel=1
@@ -10,28 +10,35 @@ depends=(
   'libpulse'
   'webkit2gtk-4.1'
   'gtk3'
-  'libayatana-appindicator' # tray icon
 )
-makedepends=('cargo' 'npm')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+optdepends=(
+  'pipewire-pulse: PulseAudio-compatible audio server (or pulseaudio)'
+  'libayatana-appindicator: system tray icon (or libappindicator)'
+)
+makedepends=('cargo' 'npm' 'git')
+# Local-repo source: clones this checkout's committed state, so `makepkg -s`
+# works today with no git remote — uncommitted changes are NOT included.
+# Once a tagged release exists upstream, swap in
+#   "$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz" + real sha256sums.
+source=("$pkgname::git+file://$startdir")
 sha256sums=('SKIP')
 
 prepare() {
-  cd "$pkgname-$pkgver"
+  cd "$srcdir/$pkgname"
   npm ci
   export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --manifest-path src-tauri/Cargo.toml
 }
 
 build() {
-  cd "$pkgname-$pkgver"
+  cd "$srcdir/$pkgname"
   # Build the frontend + release binary without running the bundler:
   # the package layout is owned by package(), not tauri-bundler.
   npx tauri build --no-bundle
 }
 
 package() {
-  cd "$pkgname-$pkgver"
+  cd "$srcdir/$pkgname"
 
   install -Dm755 "src-tauri/target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
 
@@ -53,4 +60,6 @@ EOF
     "$pkgdir/usr/share/icons/hicolor/128x128/apps/$pkgname.png"
   install -Dm644 "src-tauri/icons/128x128@2x.png" \
     "$pkgdir/usr/share/icons/hicolor/256x256/apps/$pkgname.png"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

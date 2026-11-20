@@ -28,8 +28,8 @@ npx tauri build        # release build + AppImage/deb bundles
 CLI is what's vendored in `package.json`.)
 
 Bundles land in `src-tauri/target/release/bundle/` (`appimage/`, `deb/`). On
-Arch there's a `PKGBUILD` at the repo root that builds from source and installs
-`/usr/bin/fio` + a `.desktop` entry.
+Arch there's a `PKGBUILD` at the repo root — `makepkg -s` clones the committed
+checkout, builds from source, and installs `/usr/bin/fio` + a `.desktop` entry.
 
 ## What it does
 
