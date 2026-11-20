@@ -18,12 +18,25 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "img-src": "'self' data:",
+        "style-src": "'self' 'unsafe-inline'"
+      }
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["appimage", "deb"],
+    "category": "Music",
+    "shortDescription": "Virtual audio patchbay for PipeWire/PulseAudio",
+    "longDescription": "Fio creates and manages virtual audio devices (sinks with microphone ends) on PipeWire/PulseAudio, routes app and microphone audio into them by rules, and loopbacks their monitor sources to hardware or other devices.",
+    "linux": {
+      "deb": {
+        "depends": ["libpulse0"]
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
