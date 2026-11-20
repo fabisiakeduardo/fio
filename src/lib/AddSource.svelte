@@ -117,9 +117,23 @@
   }
 
   /** Alternate targets — any physical output or other virtual device. */
-  function routeElsewhere(source: RouteSource) {
+  function routeElsewhere(source: RouteSource, after?: () => void) {
     return (t: Parameters<typeof createRoute>[1]) =>
-      void createRoute(source, t);
+      void createRoute(source, t).then((ok) => {
+        if (ok) after?.();
+      });
+  }
+
+  /**
+   * Targets a row's picker must hide: the panel's own device (the "add"
+   * button's job) and — for monitor sources — that monitor's own device,
+   * so a feed can never loop back into itself.
+   */
+  function excludedTargets(source: RouteSource) {
+    const ex = [target];
+    if ("VirtualMonitor" in source)
+      ex.push({ VirtualDevice: source.VirtualMonitor });
+    return ex;
   }
 
   function addFree() {
@@ -167,7 +181,7 @@
           <RouteForm
             {ui}
             source={item.source}
-            exclude={[target]}
+            exclude={excludedTargets(item.source)}
             placeholder="route to…"
             onroute={routeElsewhere(item.source)}
           />
@@ -203,7 +217,9 @@
       exclude={[target]}
       placeholder="route to…"
       disabled={newApp.trim() === ""}
-      onroute={routeElsewhere({ AppName: newApp.trim() })}
+      onroute={routeElsewhere({ AppName: newApp.trim() }, () => {
+        newApp = "";
+      })}
     />
   </form>
   <p class="hint">
