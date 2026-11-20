@@ -66,7 +66,11 @@ pub enum Drift {
 /// 1. Adopt-by-name: a sink already named `fio-{slug}` is kept, not
 ///    reloaded; only absent devices get a `module-null-sink` load.
 /// 2. `MoveStream` for each live sink-input matching an `AppName` rule
-///    whose target resolves — the same rule [`plan_new_stream`] applies.
+///    whose target resolves — with one startup-only relaxation: a
+///    `VirtualDevice` target counts as resolvable whenever the device is
+///    in desired state, because step 1 (re)loads every absent `fio-*`
+///    sink and `MoveStream` carries a name the executor resolves at
+///    apply time. `PhysicalSink` targets stay strict.
 /// 3. `module-loopback` for each capture/monitor route whose link is
 ///    absent. These loads come last so that ends this same plan
 ///    (re)creates — our `fio-*` sinks and their `.monitor` sources —
@@ -86,7 +90,14 @@ pub fn plan_startup(desired: &PersistedState, actual: &ActualState) -> Vec<Actio
     }
 
     for stream in &actual.sink_inputs {
-        if let Some(action) = plan_new_stream(stream, desired, actual) {
+        // VirtualDevice targets resolve by name here (the device being in
+        // desired means its sink exists or is being loaded above) — unlike
+        // `plan_new_stream`, which requires the sink in `actual` because
+        // mid-session a missing device is drift, not a pending load.
+        if let Some(action) = plan_stream_move(stream, desired, actual, |target| match target {
+            RouteTarget::VirtualDevice(_) => target_name(desired, target),
+            RouteTarget::PhysicalSink(_) => resolve_target(desired, actual, target),
+        }) {
             actions.push(action);
         }
     }
@@ -128,15 +139,34 @@ pub fn plan_new_stream(
     desired: &PersistedState,
     actual: &ActualState,
 ) -> Option<Action> {
+    plan_stream_move(stream, desired, actual, |target| {
+        resolve_target(desired, actual, target)
+    })
+}
+
+/// Shared stream-move rule: `MoveStream` when the stream isn't already on
+/// the target sink AND an `AppName` rule matches its [`rule_key`] AND
+/// `resolve` yields the target's sink name. `resolve` is what differs
+/// between the startup pass (virtual ends pending load count) and
+/// mid-session events (strict actual-presence). A stream on a sink absent
+/// from `actual` cannot already be on the target, so the presence check
+/// doubles as the already-there check.
+fn plan_stream_move(
+    stream: &StreamInfo,
+    desired: &PersistedState,
+    actual: &ActualState,
+    resolve: impl Fn(&RouteTarget) -> Option<String>,
+) -> Option<Action> {
     let key = rule_key(stream)?;
     let route = desired
         .routes
         .iter()
         .find(|r| matches!(&r.source, RouteSource::AppName(app) if app.as_str() == key))?;
-    let sink_name = resolve_target(desired, actual, &route.target)?;
-    let sink_index = actual.sinks.iter().find(|s| s.name == sink_name)?.index;
-    if stream.sink == sink_index {
-        return None;
+    let sink_name = resolve(&route.target)?;
+    if let Some(sink) = actual.sinks.iter().find(|s| s.name == sink_name) {
+        if stream.sink == sink.index {
+            return None;
+        }
     }
     Some(Action::MoveStream {
         stream_index: stream.index,
@@ -534,6 +564,36 @@ mod tests {
                 name: "module-loopback".to_string(),
                 argument: loopback_args("alsa_in", "fio-game"),
             }],
+        );
+    }
+
+    // Supplementary: pins the review fix — the same relaxation applies to
+    // stream moves. On cold start a live stream matching a rule to a
+    // VirtualDevice whose sink is absent still moves: this plan's own
+    // null-sink load precedes the MoveStream, and the action carries a
+    // name the executor resolves at apply time.
+    #[test]
+    fn startup_moves_stream_to_device_being_loaded() {
+        let desired = mk_state();
+        let mut actual = mk_actual();
+        actual.sinks.retain(|s| s.name != "fio-game");
+        actual.sources.retain(|s| s.name != "fio-game.monitor");
+        actual
+            .sink_inputs
+            .push(mk_stream(10, Some("game"), None, 1));
+
+        assert_eq!(
+            plan_startup(&desired, &actual),
+            vec![
+                Action::LoadModule {
+                    name: "module-null-sink".to_string(),
+                    argument: null_sink_args("Game", "game"),
+                },
+                Action::MoveStream {
+                    stream_index: 10,
+                    sink_name: "fio-game".to_string(),
+                },
+            ],
         );
     }
 
