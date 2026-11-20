@@ -20,14 +20,23 @@ pub fn run() {
             // without this, connectivity changes never reach the frontend.
             app.state::<commands::Manager>()
                 .set_app_handle(app.handle());
-            tray::setup(app)
+            // Tray is a nicety, not a load-bearing part of the app: any
+            // failure (missing icon, no libappindicator, setup error)
+            // must not abort startup — run windowed instead.
+            if let Err(e) = tray::setup(app) {
+                eprintln!("fio: system tray unavailable ({e}); running windowed");
+            }
+            Ok(())
         })
         // Fio is a background app: closing the window hides it to the
-        // tray — only the tray menu's Quit actually exits.
+        // tray — only the tray menu's Quit actually exits. Without a
+        // tray there is nothing to un-hide from, so let close be close.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+                if window.app_handle().tray_by_id("fio").is_some() {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
