@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import DeviceCard from "$lib/DeviceCard.svelte";
+  import Settings from "$lib/Settings.svelte";
   import SourceList from "$lib/SourceList.svelte";
   import {
     clearError,
@@ -169,6 +170,8 @@
       {/if}
     </section>
   </main>
+
+  <Settings />
 
   {#if fio.error}
     <div class="toast" role="alert">
