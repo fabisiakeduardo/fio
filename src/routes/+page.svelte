@@ -1,23 +1,37 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import DeviceCard from "$lib/DeviceCard.svelte";
+  import DeviceCanvas from "$lib/DeviceCanvas.svelte";
+  import DeviceSidebar from "$lib/DeviceSidebar.svelte";
+  import Outputs from "$lib/Outputs.svelte";
   import Settings from "$lib/Settings.svelte";
-  import SourceList from "$lib/SourceList.svelte";
   import {
     clearError,
-    createDevice,
-    deleteRoute,
     fio,
     restoreDrift,
     start,
     stop,
   } from "$lib/fio.svelte";
-  import { driftMessage, physicalSinks, routeDrift, routeLabel } from "$lib/types";
+  import { driftMessage } from "$lib/types";
 
-  let deviceName = $state("");
+  let selectedId = $state<string | null>(null);
 
   const ui = $derived(fio.ui);
-  const outputs = $derived(ui ? physicalSinks(ui) : []);
+  const selected = $derived(
+    ui?.devices.find((d) => d.id === selectedId) ?? ui?.devices[0] ?? null,
+  );
+  /** Monitor feeds of the selected device — they live in its Monitors strip. */
+  const monitorRouteIds = $derived(
+    new Set(
+      (ui?.routes ?? [])
+        .filter(
+          (r) =>
+            selected != null &&
+            "VirtualMonitor" in r.source &&
+            r.source.VirtualMonitor === selected.id,
+        )
+        .map((r) => r.id),
+    ),
+  );
   const serverOffline = $derived(
     ui !== null && ui.sinks.length === 0 && ui.sources.length === 0,
   );
@@ -26,533 +40,213 @@
     void start();
     return stop;
   });
-
-  function submitDevice(e: Event) {
-    e.preventDefault();
-    const name = deviceName.trim();
-    if (!name) return;
-    void createDevice(name).then((ok) => {
-      if (ok) deviceName = "";
-    });
-  }
-
-  /** Routes pointing at a physical sink, shown as chips under that output. */
-  function routesToSink(name: string) {
-    return (ui?.routes ?? []).filter(
-      (r) => "PhysicalSink" in r.target && r.target.PhysicalSink === name,
-    );
-  }
 </script>
 
-<div class="shell">
-  <header class="top">
-    <div class="brand">
-      <span class="mark">fio</span>
-      <span class="tag">virtual audio patchbay</span>
-    </div>
-    <div class="status">
-      {#if ui}
-        <span class="stat">{ui.live_streams.length} live stream{ui.live_streams.length === 1 ? "" : "s"}</span>
-        <span class="sep">·</span>
-        <span class="stat">{ui.devices.length} device{ui.devices.length === 1 ? "" : "s"}</span>
-        <span class="sep">·</span>
-        <span class="stat">{ui.routes.length} route{ui.routes.length === 1 ? "" : "s"}</span>
-        {#if serverOffline}
-          <span class="badge danger-badge">audio server offline</span>
-        {/if}
-      {:else if fio.loading}
-        <span class="stat dim">connecting…</span>
-      {/if}
-    </div>
-  </header>
+<div class="app">
+  <DeviceSidebar {ui} {selectedId} onselect={(id) => (selectedId = id)} />
 
-  {#if ui && ui.drift.length > 0}
-    <aside class="drift-banner" role="alert">
-      <div class="drift-head">
-        <span class="badge warn">drift</span>
-        <span class="drift-title">
-          {ui.drift.length} item{ui.drift.length === 1 ? "" : "s"} out of sync
-          with the audio server
-        </span>
-        <button class="primary" onclick={() => void restoreDrift()}>
-          restore
-        </button>
-      </div>
-      <ul class="drift-list">
-        {#each ui.drift as d, i (i)}
-          <li>{driftMessage(d, ui)}</li>
-        {/each}
-      </ul>
-    </aside>
-  {/if}
+  <div class="main">
+    {#if ui && ui.drift.length > 0}
+      <aside class="drift" role="alert">
+        <div class="drift-head">
+          <strong class="drift-title">
+            {ui.drift.length} item{ui.drift.length === 1 ? "" : "s"} out of
+            sync with the audio server
+          </strong>
+          <button class="primary" onclick={() => void restoreDrift()}>
+            restore
+          </button>
+        </div>
+        <ul class="drift-list">
+          {#each ui.drift as d, i (i)}
+            <li>{driftMessage(d, ui)}</li>
+          {/each}
+        </ul>
+      </aside>
+    {/if}
 
-  <main class="patchbay">
-    <SourceList />
+    {#if serverOffline}
+      <aside class="drift offline" role="alert">
+        <strong class="drift-title">
+          the audio server isn't answering — fio will pick up when it's back
+        </strong>
+      </aside>
+    {/if}
 
-    <section class="col" aria-label="virtual devices">
-      <header class="col-head">
-        <h2>Virtual devices</h2>
-      </header>
-
-      <form class="create-form" onsubmit={submitDevice}>
-        <input
-          class="grow"
-          placeholder="New device name — e.g. Game, Chat"
-          bind:value={deviceName}
-        />
-        <button class="primary" type="submit" disabled={deviceName.trim() === ""}>
-          add
-        </button>
-      </form>
-
-      <div class="devices">
-        {#if !ui}
-          <p class="empty">loading…</p>
-        {:else if ui.devices.length === 0}
-          <p class="empty">
-            no virtual devices yet — each one you add appears as a speaker
-            (<span class="mono">fio-*</span>) and a mic (<span class="mono"
-              >fio-*.monitor</span
+    <div class="canvas">
+      {#if !ui}
+        <div class="blank">
+          <p>connecting to the audio server…</p>
+        </div>
+      {:else if selected}
+        <DeviceCanvas {ui} device={selected} />
+      {:else}
+        <div class="blank">
+          <svg
+            viewBox="0 0 20 20"
+            width="34"
+            height="34"
+            aria-hidden="true"
+            class="blank-icon"
+          >
+            <rect
+              x="1.5"
+              y="1.5"
+              width="17"
+              height="17"
+              rx="4.5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.2"
+            />
+            <path
+              d="M6.4 13.4V8.8M10 14.6V5.6M13.6 12.4V7.8"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.2"
+              stroke-linecap="round"
+            />
+          </svg>
+          <p class="blank-title">no virtual devices yet</p>
+          <p class="blank-sub">
+            press <span class="kbd">+</span> in the sidebar — each device shows
+            up as a speaker (<span class="mono">fio-*</span>) and a mic (<span
+              class="mono">fio-*.monitor</span
             >) in your audio settings
           </p>
-        {:else}
-          {#each ui.devices as device (device.id)}
-            <DeviceCard {device} />
-          {/each}
-        {/if}
-      </div>
-    </section>
-
-    <section class="col" aria-label="outputs">
-      <header class="col-head">
-        <h2>Outputs</h2>
-      </header>
-      {#if ui}
-        {#if outputs.length === 0}
-          <p class="empty">no physical outputs found</p>
-        {:else}
-          {#each outputs as sink (sink.index)}
-            {@const playing = ui.live_streams.filter(
-              (s) => s.sink === sink.index,
-            ).length}
-            {@const routes = routesToSink(sink.name)}
-            <div class="output card">
-              <div class="row-main">
-                <span class="name">{sink.description ?? sink.name}</span>
-                <span class="sub mono">{sink.name}</span>
-              </div>
-              {#if playing > 0}
-                <span class="badge">{playing} stream{playing === 1 ? "" : "s"}</span>
-              {/if}
-              {#if routes.length > 0}
-                <div class="route-block">
-                  {#each routes as r (r.id)}
-                    <div
-                      class="route-chip"
-                      class:drifted={routeDrift(ui, r.id) !== null}
-                    >
-                      <span class="route-label">{routeLabel(r, ui)}</span>
-                      {#if routeDrift(ui, r.id)}
-                        <span class="badge warn">{routeDrift(ui, r.id)}</span>
-                      {/if}
-                      <button
-                        class="chip-x"
-                        title="delete route"
-                        onclick={() => void deleteRoute(r.id)}>×</button
-                      >
-                    </div>
-                  {/each}
-                </div>
-              {/if}
-            </div>
-          {/each}
-        {/if}
+        </div>
       {/if}
-    </section>
-  </main>
+    </div>
 
-  <Settings />
+    {#if ui}
+      <Outputs {ui} hideRouteIds={monitorRouteIds} />
+    {/if}
+
+    <Settings />
+  </div>
 
   {#if fio.error}
     <div class="toast" role="alert">
       <span class="toast-msg">{fio.error}</span>
-      <button class="chip-x" title="dismiss" onclick={clearError}>×</button>
+      <button
+        class="chip-x"
+        aria-label="dismiss error"
+        onclick={clearError}
+      >
+        <svg viewBox="0 0 10 10" width="9" height="9" aria-hidden="true">
+          <path
+            d="M1.5 1.5l7 7M8.5 1.5l-7 7"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+          />
+        </svg>
+      </button>
     </div>
   {/if}
 </div>
 
 <style>
-  .shell {
-    min-height: 100vh;
+  .app {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  .main {
     display: flex;
     flex-direction: column;
+    gap: 14px;
+    padding: 16px 20px 0;
+    overflow-y: auto;
+    min-width: 0;
   }
 
-  .top {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-    padding: 14px 20px;
-    border-bottom: 1px solid var(--border-soft);
-    background: var(--panel);
+  .canvas {
+    min-height: 0;
   }
 
-  .brand {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-  }
-
-  .mark {
-    font-family: var(--mono);
-    font-size: 20px;
-    font-weight: 700;
-    letter-spacing: -0.5px;
-    color: var(--accent);
-  }
-
-  .tag {
-    color: var(--text-dim);
-    font-size: 12px;
-  }
-
-  .status {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
-    color: var(--text-dim);
-  }
-
-  .sep {
-    color: var(--text-faint);
-  }
-
-  .stat.dim {
-    color: var(--text-faint);
-  }
-
-  .drift-banner {
-    margin: 14px 20px 0;
-    padding: 12px 14px;
-    border: 1px solid var(--warn);
-    border-radius: 8px;
+  .drift {
+    border: 1px solid var(--warn-border);
+    border-radius: var(--r-inner);
     background: var(--warn-soft);
+    padding: 10px 14px;
+  }
+
+  .drift.offline {
+    border-color: var(--danger-border);
+    background: var(--danger-soft);
+  }
+
+  .drift.offline .drift-title {
+    color: var(--danger);
   }
 
   .drift-head {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 12px;
   }
 
   .drift-title {
     flex: 1;
-    color: var(--warn);
+    font-size: 12.5px;
     font-weight: 600;
+    color: var(--warn);
   }
 
   .drift-list {
-    margin: 8px 0 0;
+    margin: 7px 0 0;
     padding-left: 18px;
     color: var(--text-dim);
     font-size: 12px;
   }
 
-  .patchbay {
-    flex: 1;
-    display: grid;
-    grid-template-columns: minmax(280px, 1fr) minmax(340px, 1.25fr) minmax(
-        280px,
-        1fr
-      );
-    gap: 14px;
-    padding: 14px 20px 20px;
-    align-items: start;
-  }
-
-  @media (max-width: 980px) {
-    .patchbay {
-      grid-template-columns: 1fr;
-    }
-  }
-
-  :global(.col) {
-    background: var(--panel);
-    border: 1px solid var(--border-soft);
-    border-radius: 10px;
-    padding: 12px;
+  .blank {
+    height: 100%;
+    min-height: 260px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
-    min-height: 200px;
-  }
-
-  :global(.col-head) {
-    display: flex;
     align-items: center;
-    justify-content: space-between;
-  }
-
-  :global(.col-head h2) {
-    margin: 0;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
+    justify-content: center;
+    gap: 8px;
+    text-align: center;
     color: var(--text-dim);
   }
 
-  :global(.group) {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-
-  :global(.group h3) {
-    margin: 4px 0 2px;
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
+  .blank-icon {
     color: var(--text-faint);
   }
 
-  :global(.card) {
-    background: var(--panel-2);
-    border: 1px solid var(--border-soft);
-    border-radius: 7px;
-    padding: 8px 10px;
-  }
-
-  :global(.row) {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  :global(.row-main) {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-  }
-
-  :global(.row-side) {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  :global(.name) {
-    font-weight: 600;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  :global(.sub) {
-    font-size: 11px;
-    color: var(--text-dim);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  :global(.mono) {
-    font-family: var(--mono);
-    font-size: 11px;
-  }
-
-  :global(.empty) {
-    margin: 4px 0;
-    color: var(--text-faint);
-    font-size: 12px;
-  }
-
-  :global(.hint) {
-    margin: 2px 0 0;
-    color: var(--text-faint);
-    font-size: 11px;
-  }
-
-  :global(.grow) {
-    flex: 1;
-    min-width: 0;
-  }
-
-  :global(.badge) {
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    padding: 1px 6px;
-    border-radius: 4px;
-    border: 1px solid var(--border);
-    color: var(--text-dim);
-    white-space: nowrap;
-  }
-
-  :global(.badge.accent) {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--accent-soft);
-  }
-
-  :global(.badge.warn) {
-    border-color: var(--warn);
-    color: var(--warn);
-    background: var(--warn-soft);
-  }
-
-  .danger-badge {
-    border-color: var(--danger);
-    color: var(--danger);
-    background: var(--danger-soft);
-  }
-
-  :global(.dot) {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--accent);
-    flex: none;
-  }
-
-  .create-form {
-    display: flex;
-    gap: 8px;
-  }
-
-  .devices {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  :global(.device) {
-    background: var(--panel-2);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--accent);
-    border-radius: 8px;
-    padding: 10px 12px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  :global(.device.missing) {
-    border-left-color: var(--warn);
-  }
-
-  :global(.device-head) {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 8px;
-  }
-
-  :global(.device-title) {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-
-  :global(.device-title .name) {
+  .blank-title {
+    margin: 4px 0 0;
     font-size: 15px;
+    font-weight: 650;
+    color: var(--text);
   }
 
-  :global(.device-actions) {
-    display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-  }
-
-  :global(.nodes) {
-    display: flex;
-    gap: 16px;
-    flex-wrap: wrap;
-    color: var(--text-dim);
-  }
-
-  :global(.node) {
-    display: flex;
-    align-items: baseline;
-    gap: 6px;
-  }
-
-  :global(.node-kind) {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    color: var(--text-faint);
-  }
-
-  :global(.route-block) {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-
-  :global(.route-block h4) {
+  .blank-sub {
     margin: 0;
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--text-faint);
+    max-width: 44ch;
+    font-size: 12.5px;
   }
 
-  :global(.route-chip) {
-    display: flex;
+  .kbd {
+    display: inline-flex;
     align-items: center;
-    gap: 6px;
-    background: var(--panel-3);
-    border: 1px solid var(--border-soft);
-    border-radius: 5px;
-    padding: 3px 6px 3px 8px;
-    font-size: 11px;
-  }
-
-  :global(.route-chip.drifted) {
-    border-color: var(--warn);
-  }
-
-  :global(.route-label) {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--text-dim);
-  }
-
-  :global(.chip-x) {
-    border: none;
-    background: none;
-    color: var(--text-faint);
+    justify-content: center;
+    min-width: 16px;
+    height: 16px;
     padding: 0 4px;
-    font-size: 14px;
-    line-height: 1;
-  }
-
-  :global(.chip-x:hover) {
-    color: var(--danger);
-  }
-
-  :global(.device-foot) {
-    display: flex;
-    justify-content: flex-end;
-  }
-
-  .output {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    background: var(--block);
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text-dim);
   }
 
   .toast {
@@ -564,17 +258,37 @@
     align-items: center;
     gap: 10px;
     max-width: min(720px, calc(100vw - 40px));
-    padding: 10px 14px;
-    border: 1px solid var(--danger);
-    border-radius: 8px;
-    background: #1c1113;
+    padding: 9px 9px 9px 14px;
+    border: 1px solid var(--danger-border);
+    border-radius: var(--r-inner);
+    background: var(--danger-soft);
     color: var(--danger);
     font-size: 12px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    box-shadow: var(--shadow-pop);
   }
 
   .toast-msg {
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  .chip-x {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--danger);
+  }
+
+  .chip-x:hover:not(:disabled) {
+    background: var(--danger-border);
+    color: var(--danger);
+    border: none;
   }
 </style>

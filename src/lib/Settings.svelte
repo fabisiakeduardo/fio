@@ -12,7 +12,14 @@
   /** Checkbox stays disabled until the real backend state is known. */
   let ready = $state(false);
 
+  const inTauri =
+    typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
   onMount(async () => {
+    if (!inTauri) {
+      ready = true;
+      return;
+    }
     try {
       autostart = await isEnabled();
     } catch (e) {
@@ -23,6 +30,7 @@
   });
 
   async function toggle() {
+    if (!inTauri) return;
     try {
       if (autostart) {
         await enable();
@@ -59,9 +67,9 @@
     align-items: center;
     justify-content: space-between;
     gap: 16px;
-    padding: 10px 20px;
-    border-top: 1px solid var(--border-soft);
-    background: var(--panel);
+    padding: 10px 2px;
+    margin-top: auto;
+    border-top: 1px solid var(--border);
   }
 
   .setting {
