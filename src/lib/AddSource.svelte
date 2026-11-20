@@ -3,9 +3,11 @@
    * The "+ Add Source" panel inside a device block. Lists everything that
    * can feed this device — live app streams, physical capture devices,
    * other devices' monitors, seen app names, and a free-text app rule —
-   * each with an inline add button that creates the route immediately.
-   * Sources already routed into this device drop out of the lists.
+   * each row with an "add" button wiring it into this device plus a
+   * "route to…" picker for every other target (physical outputs, other
+   * devices). Sources already routed into this device drop out.
    */
+  import RouteForm from "./RouteForm.svelte";
   import { createRoute } from "./fio.svelte";
   import { ACCENT, sourceKind } from "./accents";
   import {
@@ -109,8 +111,15 @@
 
   const empty = $derived(groups.length === 0);
 
+  /** Primary gesture: wire this source into the device. */
   function add(source: RouteSource) {
     void createRoute(source, target);
+  }
+
+  /** Alternate targets — any physical output or other virtual device. */
+  function routeElsewhere(source: RouteSource) {
+    return (t: Parameters<typeof createRoute>[1]) =>
+      void createRoute(source, t);
   }
 
   function addFree() {
@@ -155,6 +164,13 @@
             </svg>
             add
           </button>
+          <RouteForm
+            {ui}
+            source={item.source}
+            exclude={[target]}
+            placeholder="route to…"
+            onroute={routeElsewhere(item.source)}
+          />
         </div>
       {/each}
     {/each}
@@ -181,6 +197,14 @@
     <button class="primary" type="submit" disabled={newApp.trim() === ""}>
       add rule
     </button>
+    <RouteForm
+      {ui}
+      source={{ AppName: newApp.trim() }}
+      exclude={[target]}
+      placeholder="route to…"
+      disabled={newApp.trim() === ""}
+      onroute={routeElsewhere({ AppName: newApp.trim() })}
+    />
   </form>
   <p class="hint">
     app rules match PulseAudio's <span class="mono">application.name</span>
@@ -280,6 +304,14 @@
     font-size: 11px;
     color: var(--accent-deep);
     border-color: var(--border);
+  }
+
+  .opt :global(.route-select),
+  .free :global(.route-select) {
+    flex: none;
+    width: 118px;
+    padding: 2px 4px;
+    font-size: 11px;
   }
 
   .none {
