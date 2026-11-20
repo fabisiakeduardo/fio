@@ -3,7 +3,7 @@
 //! [`libpulse_binding`]'s `Mainloop`/`Context`/`Introspector` are `!Send` —
 //! but the threaded mainloop they wrap (`pa_threaded_mainloop`) is explicitly
 //! designed for cross-thread use: its loop runs on a libpulse-owned thread and
-//! `pa_threaded_mainloop_{lock,unlock,wait,signal,stop}` plus `pa_context_*`
+//! `pa_threaded_mainloop_{lock,unlock,stop}` plus `pa_context_*`
 //! calls may be issued from any thread that holds the mainloop lock.
 //!
 //! [`PulseEngine`] therefore keeps the `Mainloop` + `Context` pair behind a
@@ -32,6 +32,16 @@ use super::types::{ActualState, ModuleInfo, SinkInfo, SourceInfo, StreamInfo};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Poll interval while waiting for the context to become ready.
 const READY_POLL: Duration = Duration::from_millis(10);
+/// Upper bound for any single server operation's completion callback.
+/// libpulse does not guarantee the callback fires when an operation is
+/// canceled (e.g. the server dies mid-call), so every op-wait is bounded:
+/// a dead context fails the wait within [`OP_POLL`], a wedged one within
+/// `OP_TIMEOUT`. Without the bound, one hung op would hold the engine
+/// mutex — and every later engine call plus engine teardown — forever.
+const OP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Poll interval while waiting for an op — bounds how quickly a failed
+/// context is noticed mid-wait.
+const OP_POLL: Duration = Duration::from_millis(50);
 /// Number of introspection list calls in one [`ActualState`] snapshot.
 const SNAPSHOT_OPS: usize = 4;
 
@@ -50,8 +60,13 @@ pub enum EngineError {
     ConnectFailed,
     /// No `Ready` state within [`CONNECT_TIMEOUT`] — usually means no server.
     ConnectTimeout,
+    /// An operation's completion callback never fired within
+    /// [`OP_TIMEOUT`] while the context stayed `Ready` — a wedged
+    /// server or mainloop.
+    Timeout,
     /// An operation was requested while the context is not `Ready`
-    /// (e.g. the server went away).
+    /// (e.g. the server went away), or the context left `Ready`
+    /// mid-operation.
     NotReady,
     /// An introspection list call reported an error.
     ListFailed,
@@ -78,6 +93,7 @@ impl fmt::Display for EngineError {
             Self::StartMainloop => "failed to start pulse mainloop thread",
             Self::ConnectFailed => "pulse connection failed",
             Self::ConnectTimeout => "timed out waiting for pulse server",
+            Self::Timeout => "pulse operation timed out",
             Self::NotReady => "pulse context is not connected",
             Self::ListFailed => "pulse introspection query failed",
             Self::LoadFailed => "pulse module load failed",
@@ -110,10 +126,9 @@ struct Inner {
 //   context under the PA lock and stops the loop thread before `Inner`'s
 //   fields drop — so the PA thread never outlives the objects it dispatches.
 // - Callbacks execute on the PA thread but never touch the `Rc`s inside
-//   `Mainloop`/`Context`: shared state is `Arc`-based, and the only mainloop
-//   handle they use is the raw `pa_threaded_mainloop` pointer, passed to the
-//   `pa_threaded_mainloop_signal` FFI function — a plain C call with no Rust
-//   aliasing.
+//   `Mainloop`/`Context`: the shared state they carry is `Arc`-based
+//   collections and `mpsc::Sender`s — plain `Send` types, no raw pointers
+//   into the mainloop at all.
 unsafe impl Send for Inner {}
 
 /// RAII guard for the PA threaded-mainloop lock.
@@ -217,33 +232,29 @@ impl PulseEngine {
     /// streams and loaded modules.
     ///
     /// Issues the four `Introspector` list calls while holding the PA lock,
-    /// then parks in `mainloop.wait()` — which releases the lock — so the
-    /// callbacks can run on the mainloop thread. Each callback appends items
-    /// to a shared [`ActualState`]; on end-of-list the last one signals the
-    /// wait via `pa_threaded_mainloop_signal`.
+    /// then releases it and parks on a completion channel so the callbacks
+    /// can run on the mainloop thread. Each callback appends items to a
+    /// shared [`ActualState`]; on end-of-list the last one sends on the
+    /// channel — see [`list_done`]. The wait is bounded by [`wait_op`]:
+    /// a dead context fails it promptly, a wedged one times out.
     pub fn actual_state(&self) -> Result<ActualState, EngineError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         let acc = Arc::new(Mutex::new(ActualState::default()));
         let pending = Arc::new(AtomicUsize::new(SNAPSHOT_OPS));
         let failed = Arc::new(AtomicBool::new(false));
+        // Sent exactly once — by the last list op to report end-of-list.
+        let (tx, rx) = mpsc::channel();
 
-        // RAII PA lock: `wait()` below re-acquires the lock internally, and
-        // the guard's `Drop` guarantees `pa_threaded_mainloop_unlock` runs if
-        // a panic unwinds out of this section — otherwise the C mutex would
-        // stay held and `PulseEngine::drop` on another thread would deadlock.
+        // RAII PA lock: ops are issued while it is held; the guard's `Drop`
+        // guarantees `pa_threaded_mainloop_unlock` runs even if a panic
+        // unwinds out of this section — otherwise the C mutex would stay
+        // held and `PulseEngine::drop` on another thread would deadlock.
         let pa_lock = PaLock::acquire(&mut inner.mainloop);
         if inner.context.get_state() != context::State::Ready {
             drop(pa_lock);
             return Err(EngineError::NotReady);
         }
-
-        // Raw pointer to the C `pa_threaded_mainloop`, handed to each
-        // callback purely for `pa_threaded_mainloop_signal`. Stays valid for
-        // the callbacks' whole lifetime: they are all destroyed on the
-        // mainloop thread when they report end-of-list, and we do not release
-        // `inner` or stop the mainloop until `pending` hits zero below.
-        let tml = inner.mainloop._inner.get_ptr();
 
         let introspector = inner.context.introspect();
         // NOTE: the returned `Operation`s must stay alive until their
@@ -253,6 +264,7 @@ impl PulseEngine {
             let acc = Arc::clone(&acc);
             let pending = Arc::clone(&pending);
             let failed = Arc::clone(&failed);
+            let tx = tx.clone();
             move |r: ListResult<&introspect::SinkInfo>| match r {
                 ListResult::Item(i) => {
                     acc.lock().unwrap().sinks.push(SinkInfo {
@@ -262,14 +274,15 @@ impl PulseEngine {
                         module: i.owner_module,
                     });
                 }
-                ListResult::End => list_done(&pending, &failed, false, tml),
-                ListResult::Error => list_done(&pending, &failed, true, tml),
+                ListResult::End => list_done(&pending, &failed, false, &tx),
+                ListResult::Error => list_done(&pending, &failed, true, &tx),
             }
         });
         let op_sources = introspector.get_source_info_list({
             let acc = Arc::clone(&acc);
             let pending = Arc::clone(&pending);
             let failed = Arc::clone(&failed);
+            let tx = tx.clone();
             move |r: ListResult<&introspect::SourceInfo>| match r {
                 ListResult::Item(i) => {
                     acc.lock().unwrap().sources.push(SourceInfo {
@@ -280,14 +293,15 @@ impl PulseEngine {
                         monitor_of_sink: i.monitor_of_sink,
                     });
                 }
-                ListResult::End => list_done(&pending, &failed, false, tml),
-                ListResult::Error => list_done(&pending, &failed, true, tml),
+                ListResult::End => list_done(&pending, &failed, false, &tx),
+                ListResult::Error => list_done(&pending, &failed, true, &tx),
             }
         });
         let op_inputs = introspector.get_sink_input_info_list({
             let acc = Arc::clone(&acc);
             let pending = Arc::clone(&pending);
             let failed = Arc::clone(&failed);
+            let tx = tx.clone();
             move |r: ListResult<&introspect::SinkInputInfo>| match r {
                 ListResult::Item(i) => {
                     acc.lock().unwrap().sink_inputs.push(StreamInfo {
@@ -297,14 +311,15 @@ impl PulseEngine {
                         sink: i.sink,
                     });
                 }
-                ListResult::End => list_done(&pending, &failed, false, tml),
-                ListResult::Error => list_done(&pending, &failed, true, tml),
+                ListResult::End => list_done(&pending, &failed, false, &tx),
+                ListResult::Error => list_done(&pending, &failed, true, &tx),
             }
         });
         let op_modules = introspector.get_module_info_list({
             let acc = Arc::clone(&acc);
             let pending = Arc::clone(&pending);
             let failed = Arc::clone(&failed);
+            let tx = tx.clone();
             move |r: ListResult<&introspect::ModuleInfo>| match r {
                 ListResult::Item(i) => {
                     acc.lock().unwrap().modules.push(ModuleInfo {
@@ -313,36 +328,40 @@ impl PulseEngine {
                         argument: i.argument.as_deref().map(str::to_owned),
                     });
                 }
-                ListResult::End => list_done(&pending, &failed, false, tml),
-                ListResult::Error => list_done(&pending, &failed, true, tml),
+                ListResult::End => list_done(&pending, &failed, false, &tx),
+                ListResult::Error => list_done(&pending, &failed, true, &tx),
             }
         });
-
-        // `wait` releases the PA lock while parked, letting the queued list
-        // callbacks run on the mainloop thread; the last one to finish calls
-        // `pa_threaded_mainloop_signal`, waking us. `wait` may also wake
-        // spuriously — hence the loop re-checking `pending`.
-        while pending.load(Ordering::SeqCst) > 0 {
-            inner.mainloop.wait();
-        }
-
-        // All four callbacks reached end-of-list and have been destroyed by
-        // the binding's list proxy on the mainloop thread; dropping the
-        // `Operation`s now only unrefs the C objects.
-        drop(op_sinks);
-        drop(op_sources);
-        drop(op_inputs);
-        drop(op_modules);
         drop(pa_lock);
+
+        // Releasing the PA lock above lets the queued list callbacks run on
+        // the mainloop thread; the last one to finish sends on `rx`.
+        let wait = wait_op(&mut inner, &rx);
+
+        // Ops are dropped back under the PA lock: on success all four
+        // callbacks reached end-of-list and were destroyed by the binding's
+        // list proxy, so dropping only unrefs the C objects; on error this
+        // detaches any still-pending ops — their callbacks, if they ever
+        // fire, just send on a dead channel.
+        {
+            let _pa_lock = PaLock::acquire(&mut inner.mainloop);
+            drop(op_sinks);
+            drop(op_sources);
+            drop(op_inputs);
+            drop(op_modules);
+        }
+        wait?;
 
         if failed.load(Ordering::SeqCst) {
             return Err(EngineError::ListFailed);
         }
-        let state = Arc::try_unwrap(acc)
-            .expect("no other ActualState refs after ops complete")
-            .into_inner()
-            .unwrap_or_else(|e| e.into_inner());
-        Ok(state)
+        // `mem::take`, not `Arc::try_unwrap`: `list_done` sends inside the
+        // callback, so the receiver can wake while the last callback's
+        // `acc` clone is still alive on the mainloop thread — a
+        // `try_unwrap` would race its destruction.
+        Ok(std::mem::take(
+            &mut *acc.lock().unwrap_or_else(|e| e.into_inner()),
+        ))
     }
 
     /// Loads a module into the server and returns its module index.
@@ -352,10 +371,11 @@ impl PulseEngine {
     /// The index identifies the module to [`Self::unload_module`] and in
     /// `ActualState::modules` — it is per-session, never persist it.
     ///
-    /// Same discipline as [`Self::actual_state`]: PA lock → issue → park in
-    /// `mainloop.wait()` → collect. The index callback fires exactly once
-    /// on the mainloop thread — with [`def::INVALID_INDEX`] on failure,
-    /// surfaced here as [`EngineError::LoadFailed`] — then signals `wait`.
+    /// Same discipline as [`Self::actual_state`]: PA lock → issue → release
+    /// → wait on a completion channel ([`wait_op`]) → collect. The index
+    /// callback fires exactly once on the mainloop thread — with
+    /// [`def::INVALID_INDEX`] on failure, surfaced here as
+    /// [`EngineError::LoadFailed`] — then sends completion.
     ///
     /// # Panics
     /// Panics if libpulse refuses the request itself (a null operation) —
@@ -367,30 +387,30 @@ impl PulseEngine {
             drop(pa_lock);
             return Err(EngineError::NotReady);
         }
-        let tml = inner.mainloop._inner.get_ptr();
 
         let result = Arc::new(Mutex::new(None::<u32>));
-        let done = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
 
         let op = inner.context.introspect().load_module(name, argument, {
             let result = Arc::clone(&result);
-            let done = Arc::clone(&done);
             move |index: u32| {
                 *result.lock().unwrap() = Some(index);
-                op_done(&done, tml);
+                op_done(&tx);
             }
         });
-
-        while !done.load(Ordering::SeqCst) {
-            inner.mainloop.wait();
-        }
-        drop(op);
         drop(pa_lock);
+
+        let wait = wait_op(&mut inner, &rx);
+        {
+            let _pa_lock = PaLock::acquire(&mut inner.mainloop);
+            drop(op);
+        }
+        wait?;
 
         let index = result
             .lock()
             .unwrap()
-            .expect("load_module callback runs exactly once before done");
+            .expect("load_module callback runs exactly once before send");
         match index {
             def::INVALID_INDEX => Err(EngineError::LoadFailed),
             index => Ok(index),
@@ -401,8 +421,9 @@ impl PulseEngine {
     /// or `ActualState::modules`). Returns [`EngineError::UnloadFailed`]
     /// when the server reports failure (e.g. unknown index).
     ///
-    /// Same lock → issue → wait → collect pattern as [`Self::load_module`];
-    /// the success callback fires exactly once on the mainloop thread.
+    /// Same lock → issue → wait-on-channel → collect pattern as
+    /// [`Self::load_module`]; the success callback fires exactly once on
+    /// the mainloop thread.
     pub fn unload_module(&self, index: u32) -> Result<(), EngineError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pa_lock = PaLock::acquire(&mut inner.mainloop);
@@ -410,25 +431,25 @@ impl PulseEngine {
             drop(pa_lock);
             return Err(EngineError::NotReady);
         }
-        let tml = inner.mainloop._inner.get_ptr();
 
         let ok = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
 
         let op = inner.context.introspect().unload_module(index, {
             let ok = Arc::clone(&ok);
-            let done = Arc::clone(&done);
             move |success: bool| {
                 ok.store(success, Ordering::SeqCst);
-                op_done(&done, tml);
+                op_done(&tx);
             }
         });
-
-        while !done.load(Ordering::SeqCst) {
-            inner.mainloop.wait();
-        }
-        drop(op);
         drop(pa_lock);
+
+        let wait = wait_op(&mut inner, &rx);
+        {
+            let _pa_lock = PaLock::acquire(&mut inner.mainloop);
+            drop(op);
+        }
+        wait?;
 
         match ok.load(Ordering::SeqCst) {
             true => Ok(()),
@@ -458,7 +479,6 @@ impl PulseEngine {
             drop(pa_lock);
             return rx;
         }
-        let tml = inner.mainloop._inner.get_ptr();
 
         inner
             .context
@@ -478,19 +498,22 @@ impl PulseEngine {
             })));
 
         // Wait for the subscribe op itself so a caller can rely on events
-        // being delivered the moment this returns.
-        let done = Arc::new(AtomicBool::new(false));
+        // being delivered the moment this returns. Best-effort: a wedged
+        // server yields a receiver that simply sees no events, which the
+        // driver already tolerates.
+        let (tx_done, rx_done) = mpsc::channel::<()>();
         let op = inner
             .context
             .subscribe(InterestMaskSet::SINK_INPUT | InterestMaskSet::MODULE, {
-                let done = Arc::clone(&done);
-                move |_success: bool| op_done(&done, tml)
+                move |_success: bool| op_done(&tx_done)
             });
-        while !done.load(Ordering::SeqCst) {
-            inner.mainloop.wait();
-        }
-        drop(op);
         drop(pa_lock);
+
+        let _ = wait_op(&mut inner, &rx_done);
+        {
+            let _pa_lock = PaLock::acquire(&mut inner.mainloop);
+            drop(op);
+        }
         rx
     }
 
@@ -498,8 +521,9 @@ impl PulseEngine {
     /// server index. [`EngineError::MoveFailed`] when the server reports
     /// failure — e.g. the stream ended or the index is stale.
     ///
-    /// Same lock → issue → wait → collect pattern as [`Self::load_module`];
-    /// the success callback fires exactly once on the mainloop thread.
+    /// Same lock → issue → wait-on-channel → collect pattern as
+    /// [`Self::load_module`]; the success callback fires exactly once on
+    /// the mainloop thread.
     pub fn move_sink_input(&self, stream_index: u32, sink_index: u32) -> Result<(), EngineError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pa_lock = PaLock::acquire(&mut inner.mainloop);
@@ -507,27 +531,28 @@ impl PulseEngine {
             drop(pa_lock);
             return Err(EngineError::NotReady);
         }
-        let tml = inner.mainloop._inner.get_ptr();
 
         let ok = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
         let op = inner.context.introspect().move_sink_input_by_index(
             stream_index,
             sink_index,
             Some(Box::new({
                 let ok = Arc::clone(&ok);
-                let done = Arc::clone(&done);
                 move |success: bool| {
                     ok.store(success, Ordering::SeqCst);
-                    op_done(&done, tml);
+                    op_done(&tx);
                 }
             })),
         );
-        while !done.load(Ordering::SeqCst) {
-            inner.mainloop.wait();
-        }
-        drop(op);
         drop(pa_lock);
+
+        let wait = wait_op(&mut inner, &rx);
+        {
+            let _pa_lock = PaLock::acquire(&mut inner.mainloop);
+            drop(op);
+        }
+        wait?;
 
         match ok.load(Ordering::SeqCst) {
             true => Ok(()),
@@ -538,7 +563,7 @@ impl PulseEngine {
     /// The server's current default sink and source names.
     ///
     /// `get_server_info`'s callback fires exactly once on the mainloop
-    /// thread — same lock → issue → wait → collect pattern as
+    /// thread — same lock → issue → wait-on-channel → collect pattern as
     /// [`Self::load_module`].
     pub fn server_defaults(&self) -> Result<ServerDefaults, EngineError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -547,26 +572,27 @@ impl PulseEngine {
             drop(pa_lock);
             return Err(EngineError::NotReady);
         }
-        let tml = inner.mainloop._inner.get_ptr();
 
         let info = Arc::new(Mutex::new(None::<ServerDefaults>));
-        let done = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
         let op = inner.context.introspect().get_server_info({
             let info = Arc::clone(&info);
-            let done = Arc::clone(&done);
             move |i: &introspect::ServerInfo| {
                 *info.lock().unwrap() = Some(ServerDefaults {
                     default_sink: i.default_sink_name.as_deref().map(str::to_owned),
                     default_source: i.default_source_name.as_deref().map(str::to_owned),
                 });
-                op_done(&done, tml);
+                op_done(&tx);
             }
         });
-        while !done.load(Ordering::SeqCst) {
-            inner.mainloop.wait();
-        }
-        drop(op);
         drop(pa_lock);
+
+        let wait = wait_op(&mut inner, &rx);
+        {
+            let _pa_lock = PaLock::acquire(&mut inner.mainloop);
+            drop(op);
+        }
+        wait?;
 
         info.lock().unwrap().take().ok_or(EngineError::ListFailed)
     }
@@ -575,7 +601,8 @@ impl PulseEngine {
     /// action). [`EngineError::SetDefaultFailed`] when the server reports
     /// failure, e.g. no such source.
     ///
-    /// Same lock → issue → wait → collect pattern as [`Self::load_module`].
+    /// Same lock → issue → wait-on-channel → collect pattern as
+    /// [`Self::load_module`].
     ///
     /// # Panics
     /// Panics if `name` contains an interior NUL (the binding unwraps its
@@ -587,23 +614,24 @@ impl PulseEngine {
             drop(pa_lock);
             return Err(EngineError::NotReady);
         }
-        let tml = inner.mainloop._inner.get_ptr();
 
         let ok = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
         let op = inner.context.set_default_source(name, {
             let ok = Arc::clone(&ok);
-            let done = Arc::clone(&done);
             move |success: bool| {
                 ok.store(success, Ordering::SeqCst);
-                op_done(&done, tml);
+                op_done(&tx);
             }
         });
-        while !done.load(Ordering::SeqCst) {
-            inner.mainloop.wait();
-        }
-        drop(op);
         drop(pa_lock);
+
+        let wait = wait_op(&mut inner, &rx);
+        {
+            let _pa_lock = PaLock::acquire(&mut inner.mainloop);
+            drop(op);
+        }
+        wait?;
 
         match ok.load(Ordering::SeqCst) {
             true => Ok(()),
@@ -671,39 +699,70 @@ fn wait_ready(
     }
 }
 
+/// Parks until an op's completion arrives on `rx`, the context leaves
+/// `Ready`, or [`OP_TIMEOUT`] passes. Called with `self.inner` held (ops
+/// stay serialized) but *not* the PA lock — callbacks run on the mainloop
+/// thread while this waits; the lock is only re-taken for each brief
+/// `get_state` poll.
+///
+/// `Err(NotReady)`: the context failed or terminated mid-op — the server
+/// died or is going away, the op will never complete. `Err(Timeout)`:
+/// the context stayed `Ready` but the callback never came — wedged, the
+/// op is abandoned (dropping its `Operation` detaches it). This bound is
+/// what keeps a dead server from hanging every engine caller — and
+/// `PulseEngine::drop` via the `inner` mutex — forever: libpulse does
+/// not guarantee the op callback fires when an operation is canceled.
+fn wait_op(inner: &mut Inner, rx: &mpsc::Receiver<()>) -> Result<(), EngineError> {
+    let deadline = Instant::now() + OP_TIMEOUT;
+    loop {
+        match rx.recv_timeout(OP_POLL) {
+            Ok(()) => return Ok(()),
+            // The completion sender died without sending — only possible
+            // if the op's callback was torn down with a dead context.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(EngineError::NotReady);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        let state = {
+            let _pa_lock = PaLock::acquire(&mut inner.mainloop);
+            inner.context.get_state()
+        };
+        if state != context::State::Ready {
+            return Err(EngineError::NotReady);
+        }
+        if Instant::now() >= deadline {
+            return Err(EngineError::Timeout);
+        }
+    }
+}
+
 /// Runs on the PA mainloop thread when one of the snapshot list ops reports
-/// `End`/`Error`. Decrements the pending counter and, once all ops are done,
-/// signals the `mainloop.wait()` in [`PulseEngine::actual_state`].
+/// `End`/`Error`. Records the error flag, decrements the pending counter,
+/// and — once all ops are done — sends completion to the `wait_op`
+/// receiver in [`PulseEngine::actual_state`]. `send` never blocks, so the
+/// callback never stalls the loop thread; a dead receiver just means the
+/// caller already gave up.
 fn list_done(
     pending: &AtomicUsize,
     failed: &AtomicBool,
     had_error: bool,
-    tml: *mut libpulse_binding::mainloop::threaded::MainloopInternal,
+    tx: &mpsc::Sender<()>,
 ) {
     if had_error {
         failed.store(true, Ordering::SeqCst);
     }
     if pending.fetch_sub(1, Ordering::SeqCst) == 1 {
-        // SAFETY: `tml` is the engine's threaded mainloop, which outlives
-        // this callback — `actual_state` does not return (and `shutdown`
-        // cannot proceed on another thread) until every pending op has run
-        // this function. Signalling a threaded mainloop from within one of
-        // its own callbacks is the documented way to wake a `wait()`ing
-        // thread.
-        unsafe { libpulse_sys::pa_threaded_mainloop_signal(tml, 0) };
+        let _ = tx.send(());
     }
 }
 
 /// Runs on the PA mainloop thread when a single-shot operation callback
-/// (module load/unload) fires. Flags completion and signals the
-/// `mainloop.wait()` in the caller. See [`list_done`] for why the raw
-/// `pa_threaded_mainloop_signal` call is sound here.
-fn op_done(done: &AtomicBool, tml: *mut libpulse_binding::mainloop::threaded::MainloopInternal) {
-    done.store(true, Ordering::SeqCst);
-    // SAFETY: `tml` is the engine's threaded mainloop, which outlives this
-    // callback — the caller does not return (and engine teardown cannot
-    // proceed) until `done` is set, which happens inside this function.
-    unsafe { libpulse_sys::pa_threaded_mainloop_signal(tml, 0) };
+/// (module load/unload, stream move, etc.) fires: sends completion to the
+/// caller's `wait_op` receiver. See [`list_done`] — `send` never blocks
+/// and a dead receiver is harmless.
+fn op_done(tx: &mpsc::Sender<()>) {
+    let _ = tx.send(());
 }
 
 /// `pactl`-style argument string for `module-null-sink`: a virtual sink
