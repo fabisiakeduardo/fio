@@ -16,3 +16,4 @@ vite.config.ts.timestamp-*
 /pkg/
 /src/fio/
 *.pkg.tar.zst
+/fio/
