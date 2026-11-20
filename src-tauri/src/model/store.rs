@@ -84,10 +84,19 @@ impl Store {
 
     /// Record a seen app name, most-recently-used first, capped at 50.
     /// Re-recording an existing name moves it to the front.
+    ///
+    /// Memory-only: stream events arrive too often to justify a disk
+    /// write each. Callers flush on a cadence — the driver persists at
+    /// most once per few seconds and once more on shutdown.
     pub fn record_seen_app(&mut self, app_name: &str) {
         self.state.seen_apps.retain(|a| a != app_name);
         self.state.seen_apps.insert(0, app_name.to_string());
         self.state.seen_apps.truncate(SEEN_APPS_MAX);
+    }
+
+    /// Persist accumulated state — the counterpart of
+    /// [`Self::record_seen_app`]'s deferred write.
+    pub fn flush(&self) {
         self.persist();
     }
 
@@ -228,6 +237,12 @@ mod tests {
         assert_eq!(seen.len(), 50);
         assert_eq!(seen[0], "app-59");
         assert_eq!(seen.iter().filter(|a| *a == "app-59").count(), 1);
+
+        // Writes are deferred: nothing on disk until `flush` — the
+        // driver's debounce cadence is what persists them.
+        assert!(Store::load(path.clone()).state().seen_apps.is_empty());
+        store.flush();
+        assert_eq!(Store::load(path.clone()).state().seen_apps.len(), 50);
 
         let _ = std::fs::remove_file(&path);
     }

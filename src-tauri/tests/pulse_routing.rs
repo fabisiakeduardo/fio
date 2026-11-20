@@ -5,7 +5,7 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use fio_lib::audio::{PulseEngine, pulse_available};
 use fio_lib::model::{RouteSource, RouteTarget, Store};
@@ -71,7 +71,7 @@ fn new_stream_gets_routed_by_rule() {
         engine: Arc::clone(&engine),
         sink_name: SINK_NAME.to_string(),
     };
-    let driver = Driver::new(store, Arc::clone(&engine));
+    let driver = Driver::new(store, Arc::new(Mutex::new(Some(Arc::clone(&engine)))));
 
     let vdev_sink = wait_for("fio-route-test sink to appear", || {
         engine

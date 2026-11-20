@@ -9,7 +9,7 @@
 mod driver;
 mod plan;
 
-pub use driver::Driver;
+pub use driver::{Driver, EngineSlot};
 pub use plan::{
     Action, Drift, detect_drift, link_names, link_present, plan_new_stream, plan_startup, rule_key,
 };

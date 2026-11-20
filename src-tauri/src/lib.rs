@@ -6,6 +6,8 @@ pub mod tray;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // `Manager` provides `app.state`, `window.app_handle`, `tray_by_id`.
+    use tauri::Manager as _;
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             // Required by the signature; ignored on Linux (XDG autostart).
@@ -13,7 +15,13 @@ pub fn run() {
             None,
         ))
         .manage(commands::Manager::new())
-        .setup(tray::setup)
+        .setup(|app| {
+            // The driver notifies the UI on engine connect/disconnect —
+            // without this, connectivity changes never reach the frontend.
+            app.state::<commands::Manager>()
+                .set_app_handle(app.handle());
+            tray::setup(app)
+        })
         // Fio is a background app: closing the window hides it to the
         // tray — only the tray menu's Quit actually exits.
         .on_window_event(|window, event| {

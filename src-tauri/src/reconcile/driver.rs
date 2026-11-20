@@ -3,21 +3,26 @@
 //!
 //! Enforcement is deliberately asymmetric:
 //!
-//! - **Heal at launch** — [`Driver::new`] runs [`plan_startup`] once and
-//!   applies the whole plan (adopt or load `fio-*` sinks, move matching
-//!   live streams, load missing loopbacks).
+//! - **Heal once per connection** — the event thread runs
+//!   [`plan_startup`] after every successful attach (adopt or load
+//!   `fio-*` sinks, move matching live streams, load missing loopbacks).
 //! - **Mid-session enforce only on new streams** — a `NewSinkInput` event
 //!   records the app name and runs [`plan_new_stream`], moving just that
 //!   stream when a rule matches.
 //! - **Everything else is drift** — module removals and changes recompute
 //!   [`detect_drift`] and surface it via [`Driver::drift`]; the driver
 //!   never auto-fixes something that was there and went away.
+//! - **Reconnect is automatic** — a dead context (`NotReady`/`Timeout`
+//!   from engine ops) is dropped from the shared engine slot and
+//!   `PulseEngine::start()` retried on a backoff inside the same event
+//!   loop, so a server restart self-heals instead of leaving enforcement
+//!   inert — and a degraded launch picks up the server when it appears.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::audio::{ActualState, EngineError, PulseEngine, PulseEvent};
 use crate::model::{PersistedState, Store};
@@ -25,9 +30,29 @@ use crate::model::{PersistedState, Store};
 use super::{Action, Drift, detect_drift, plan_new_stream, plan_startup, rule_key};
 
 /// How often the event loop recomputes [`detect_drift`] even when no
-/// events arrive — drift surfaces within one tick rather than only on the
-/// next server change.
+/// events arrive — drift surfaces within one tick rather than only on
+/// the next server change.
 const RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Backoff between reconnect attempts after the engine dies — each
+/// attempt itself blocks up to the engine's connect timeout.
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+/// How often the loop checks the shutdown flag while disconnected —
+/// bounds event-thread join time on drop.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(200);
+/// Minimum interval between `seen_apps` disk writes — stream events
+/// update memory immediately; the drift tick flushes at this cadence
+/// and [`Driver::drop`] flushes once more, instead of writing per event.
+const SEEN_PERSIST_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Shared, swappable handle to the live engine connection: `None` while
+/// the audio server is unreachable.
+///
+/// The driver's event thread is the only writer — it clears the slot
+/// when the context dies and refills it on a [`RECONNECT_BACKOFF`]
+/// retry. Readers (the command layer, [`Driver::apply`]) just clone the
+/// `Arc` out; the lock is never held across an engine call, so a slow
+/// snapshot can't stall them.
+pub type EngineSlot = Arc<Mutex<Option<Arc<PulseEngine>>>>;
 
 /// Mutable state shared between the driver (command path) and its event
 /// thread. One mutex; critical sections are brief and the engine is never
@@ -40,55 +65,77 @@ struct Shared {
     rescues: HashMap<u32, String>,
     /// Latest [`detect_drift`] result, refreshed by the event loop.
     drift: Vec<Drift>,
+    /// Run once when the engine dies and once when it comes back —
+    /// installed from the command layer so the UI re-queries `ui_state`
+    /// on connectivity changes without waiting for a mutation.
+    notify: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// `record_seen_app` writes are memory-only; this flags pending
+    /// changes the drift tick flushes on [`SEEN_PERSIST_INTERVAL`].
+    seen_dirty: bool,
+    last_seen_persist: Instant,
 }
 
-/// Owns the [`Store`] + [`PulseEngine`] pair and the event thread between
-/// them. `Send + Sync` so it can sit in Tauri state next to the engine.
+/// Owns the [`Store`] and the event thread between it and the engine
+/// slot. `Send + Sync` so it can sit in Tauri state next to the slot.
 pub struct Driver {
-    engine: Arc<PulseEngine>,
+    slot: EngineSlot,
     shared: Arc<Mutex<Shared>>,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Driver {
-    /// Takes ownership of `store`, subscribes to engine events, runs the
-    /// [`plan_startup`] heal pass once, then spawns the event thread.
+    /// Takes ownership of `store` and spawns the event thread, which owns
+    /// the whole connection lifecycle: attach (or retry) → subscribe →
+    /// heal → dispatch. The subscription is established *before* each
+    /// heal pass — events that fire mid-heal sit in the channel and are
+    /// handled right after, so no new stream escapes enforcement.
     ///
-    /// The subscription is established *before* the heal pass runs and the
-    /// thread is spawned after — events that fire mid-heal sit in the
-    /// channel and are handled once the thread starts, so no new stream
-    /// escapes enforcement.
-    ///
-    /// The heal pass is best-effort: if the server isn't answering yet,
-    /// the driver still comes up and the event loop's drift tick reports
-    /// the gap instead.
-    pub fn new(store: Store, engine: Arc<PulseEngine>) -> Self {
-        let rx = engine.subscribe();
-        let mut driver = Self {
-            engine: Arc::clone(&engine),
-            shared: Arc::new(Mutex::new(Shared {
-                store,
-                rescues: HashMap::new(),
-                drift: Vec::new(),
-            })),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            thread: None,
-        };
-
-        driver.startup_heal();
-
+    /// When the slot is empty (no server at launch) the thread retries
+    /// `PulseEngine::start()` on a [`RECONNECT_BACKOFF`] — the driver
+    /// always runs, so commands persist mutations regardless and the
+    /// first successful attach heals them.
+    pub fn new(store: Store, slot: EngineSlot) -> Self {
+        let shared = Arc::new(Mutex::new(Shared {
+            store,
+            rescues: HashMap::new(),
+            drift: Vec::new(),
+            notify: None,
+            seen_dirty: false,
+            last_seen_persist: Instant::now(),
+        }));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let thread = {
-            let engine = Arc::clone(&engine);
-            let shared = Arc::clone(&driver.shared);
-            let shutdown = Arc::clone(&driver.shutdown);
+            let slot = Arc::clone(&slot);
+            let shared = Arc::clone(&shared);
+            let shutdown = Arc::clone(&shutdown);
             thread::Builder::new()
                 .name("fio-events".to_string())
-                .spawn(move || event_loop(rx, engine, shared, shutdown))
+                .spawn(move || event_loop(&slot, &shared, &shutdown))
                 .expect("failed to spawn fio event thread")
         };
-        driver.thread = Some(thread);
-        driver
+        Self {
+            slot,
+            shared,
+            shutdown,
+            thread: Some(thread),
+        }
+    }
+
+    /// The live engine, or `None` while the server is unreachable —
+    /// degraded start or a dead context awaiting reconnect.
+    fn engine(&self) -> Option<Arc<PulseEngine>> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Installs the callback the event thread runs on engine connect /
+    /// death — the command layer uses it to emit `fio-state-changed` so
+    /// the UI reflects connectivity changes without a user mutation.
+    pub fn set_notify(&self, f: impl Fn() + Send + Sync + 'static) {
+        self.shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .notify = Some(Arc::new(f));
     }
 
     /// The latest drift report — recomputed on every module-removal /
@@ -105,8 +152,10 @@ impl Driver {
     /// resolves `sink_name` against a fresh snapshot — the name→index
     /// mapping is per-session and may have shifted since planning — and,
     /// on success, records the stream's previous sink in `rescues`.
+    /// [`EngineError::NotReady`] while no engine is connected.
     pub fn apply(&self, a: Action) -> Result<(), EngineError> {
-        apply_action(&self.engine, &self.shared, a)
+        let engine = self.engine().ok_or(EngineError::NotReady)?;
+        apply_action(&engine, &self.shared, a)
     }
 
     /// Removes and returns the previous-sink name recorded for a stream
@@ -147,105 +196,223 @@ impl Driver {
 
     /// Recomputes drift from a fresh snapshot right now. Called after
     /// command-path mutations so the UI's drift list reflects them
-    /// immediately instead of on the next event tick.
+    /// immediately instead of on the next event tick. No-op while the
+    /// server is unreachable.
     pub fn recheck_drift(&self) {
-        update_drift(&self.engine, &self.shared);
-    }
-
-    /// The launch-time heal: plan against one snapshot, apply in order.
-    /// `MoveStream` actions resolve their sink name at apply time, so
-    /// devices loaded earlier in this same pass are already routable.
-    fn startup_heal(&self) {
-        let Ok(actual) = self.engine.actual_state() else {
-            return;
-        };
-        let actions = {
-            let shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-            plan_startup(shared.store.state(), &actual)
-        };
-        for action in actions {
-            // Best effort — a failed action is reported as drift, not retried.
-            let _ = self.apply(action);
+        if let Some(engine) = self.engine() {
+            let _ = update_drift(&engine, &self.shared);
         }
-        update_drift(&self.engine, &self.shared);
     }
 }
 
 impl Drop for Driver {
     /// Flags the event thread down and joins it. The thread is either
-    /// parked in `recv_timeout` (wakes within [`RECHECK_INTERVAL`]) or
-    /// mid-snapshot (bounded by the server answering). The engine may
-    /// outlive the driver; the subscribe callback's `Sender` then just
-    /// fails its sends into the dead channel.
+    /// parked in `recv_timeout`/`sleep` (wakes within a poll interval),
+    /// mid-snapshot (bounded by the engine's op timeout), or mid-connect
+    /// (bounded by the connect timeout). A slot engine may outlive the
+    /// driver; the subscribe callback's `Sender` then just fails its
+    /// sends into the dead channel.
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-    }
-}
-
-/// The event thread's loop: dispatch each [`PulseEvent`], re-check drift
-/// on a tick so changes outside the subscription mask still surface, and
-/// exit when the engine's `Sender` dies (engine drop) or the driver flags
-/// shutdown.
-fn event_loop(
-    rx: mpsc::Receiver<PulseEvent>,
-    engine: Arc<PulseEngine>,
-    shared: Arc<Mutex<Shared>>,
-    shutdown: Arc<AtomicBool>,
-) {
-    while !shutdown.load(Ordering::SeqCst) {
-        match rx.recv_timeout(RECHECK_INTERVAL) {
-            Ok(PulseEvent::NewSinkInput(index)) => on_new_sink_input(index, &engine, &shared),
-            // RemovedModule and Other: something changed outside the heal
-            // path — report it via drift, never auto-fix.
-            Ok(_) => update_drift(&engine, &shared),
-            Err(mpsc::RecvTimeoutError::Timeout) => update_drift(&engine, &shared),
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        // Final `seen_apps` flush — the debounce tick no longer runs.
+        let shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        if shared.seen_dirty {
+            shared.store.flush();
         }
     }
 }
 
-/// Mid-session enforcement for one new stream: snapshot, record the app
-/// name for the UI's "recently seen" list, and apply [`plan_new_stream`]'s
-/// verdict — a `MoveStream` or nothing.
-fn on_new_sink_input(index: u32, engine: &PulseEngine, shared: &Mutex<Shared>) {
-    // A fresh snapshot, not a single-stream fetch: the index alone tells
-    // us nothing about names, a short-lived stream may already be gone,
-    // and the planner wants full sink context anyway.
+/// A live engine plus the receiver of its event subscription.
+struct Conn {
+    engine: Arc<PulseEngine>,
+    rx: mpsc::Receiver<PulseEvent>,
+}
+
+/// The event thread's loop: dispatch each [`PulseEvent`], re-check drift
+/// on a tick so changes outside the subscription mask still surface,
+/// and — the resilience half — detect a dead context, drop it from the
+/// slot, and reconnect on a [`RECONNECT_BACKOFF`].
+fn event_loop(slot: &EngineSlot, shared: &Mutex<Shared>, shutdown: &AtomicBool) {
+    // Attach subscribes + heals when the slot already holds an engine
+    // (launch); on an empty slot it doubles as the first reconnect try.
+    let mut conn = attach(slot, shared);
+    let mut retry_at = Instant::now() + RECONNECT_BACKOFF;
+    while !shutdown.load(Ordering::SeqCst) {
+        match &conn {
+            Some(c) => {
+                let result = match c.rx.recv_timeout(RECHECK_INTERVAL) {
+                    Ok(PulseEvent::NewSinkInput(index)) => {
+                        on_new_sink_input(index, &c.engine, shared)
+                    }
+                    // RemovedModule and Other: something changed outside
+                    // the heal path — report it via drift, never auto-fix.
+                    Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                        update_drift(&c.engine, shared)
+                    }
+                    // The subscription's Sender died — only possible if
+                    // the engine was dropped or never connected.
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        Err(EngineError::NotReady)
+                    }
+                };
+                if let Err(e) = result
+                    && is_dead(&e)
+                {
+                    // The connection is unrecoverable: drop it from the
+                    // slot (commands now report "audio server
+                    // unavailable") and back off.
+                    clear_slot(slot, &c.engine);
+                    conn = None;
+                    retry_at = Instant::now() + RECONNECT_BACKOFF;
+                    notify(shared);
+                }
+            }
+            None => {
+                if Instant::now() < retry_at {
+                    thread::sleep(SHUTDOWN_POLL.min(retry_at - Instant::now()));
+                    continue;
+                }
+                conn = attach(slot, shared);
+                if conn.is_some() {
+                    notify(shared);
+                } else {
+                    retry_at = Instant::now() + RECONNECT_BACKOFF;
+                }
+            }
+        }
+    }
+}
+
+/// Builds a live-connection pair: the engine the slot already holds, or
+/// a fresh `PulseEngine::start()` that gets stored back into the slot.
+/// The subscription is established *before* the heal pass runs — events
+/// that fire mid-heal sit in the channel and are handled once `attach`
+/// returns, so no new stream escapes enforcement. The heal itself is
+/// best-effort: a snapshot failure surfaces as drift.
+fn attach(slot: &EngineSlot, shared: &Mutex<Shared>) -> Option<Conn> {
+    let engine = {
+        let held = slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        match held {
+            Some(engine) => engine,
+            None => Arc::new(PulseEngine::start().ok()?),
+        }
+    };
+    // Publish before subscribing so command-path readers only ever see a
+    // slot engine that is fully wired.
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&engine));
+    let rx = engine.subscribe();
+    startup_heal(&engine, shared);
+    Some(Conn { engine, rx })
+}
+
+/// Clears `slot` only if it still points at `engine` — belt and
+/// suspenders against clearing a newer connection (the event thread is
+/// the only writer, so the check is redundant but cheap).
+fn clear_slot(slot: &EngineSlot, engine: &Arc<PulseEngine>) {
+    let mut held = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if held.as_ref().is_some_and(|e| Arc::ptr_eq(e, engine)) {
+        *held = None;
+    }
+}
+
+/// Runs the installed connectivity callback, if any — cloned out first
+/// so the shared lock isn't held while outside code runs.
+fn notify(shared: &Mutex<Shared>) {
+    let f = shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .notify
+        .clone();
+    if let Some(f) = f {
+        f();
+    }
+}
+
+/// Whether an engine-op failure means the connection itself is dead:
+/// `NotReady` — the context left `Ready` (server gone); `Timeout` — the
+/// context claims `Ready` but stopped answering ops. `ListFailed` and
+/// friends are transient server answers — the engine stays.
+fn is_dead(e: &EngineError) -> bool {
+    matches!(e, EngineError::NotReady | EngineError::Timeout)
+}
+
+/// The launch/reconnect heal: plan against one snapshot, apply in order.
+/// `MoveStream` actions resolve their sink name at apply time, so
+/// devices loaded earlier in this same pass are already routable.
+fn startup_heal(engine: &PulseEngine, shared: &Mutex<Shared>) {
     let Ok(actual) = engine.actual_state() else {
         return;
     };
+    let actions = {
+        let shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+        plan_startup(shared.store.state(), &actual)
+    };
+    for action in actions {
+        // Best effort — a failed action is reported as drift, not retried.
+        let _ = apply_action(engine, shared, action);
+    }
+    let _ = update_drift(engine, shared);
+}
+
+/// Mid-session enforcement for one new stream: snapshot, record the app
+/// name for the UI's "recently seen" list, and apply [`plan_new_stream`]'s
+/// verdict — a `MoveStream` or nothing. The snapshot error propagates so
+/// the event loop can tell a dead connection from a quiet one.
+fn on_new_sink_input(
+    index: u32,
+    engine: &PulseEngine,
+    shared: &Mutex<Shared>,
+) -> Result<(), EngineError> {
+    // A fresh snapshot, not a single-stream fetch: the index alone tells
+    // us nothing about names, a short-lived stream may already be gone,
+    // and the planner wants full sink context anyway.
+    let actual = engine.actual_state()?;
     let Some(stream) = actual
         .sink_inputs
         .iter()
         .find(|s| s.index == index)
         .cloned()
     else {
-        return;
+        return Ok(());
     };
     let action = {
         let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(app) = rule_key(&stream) {
             shared.store.record_seen_app(app);
+            shared.seen_dirty = true;
         }
         plan_new_stream(&stream, shared.store.state(), &actual)
     };
     if let Some(action) = action {
         let _ = apply_action(engine, shared, action);
     }
+    Ok(())
 }
 
-/// Recomputes drift from a fresh snapshot; leaves the previous report in
-/// place when the server isn't answering (a transient failure shouldn't
-/// blank the UI's drift list).
-fn update_drift(engine: &PulseEngine, shared: &Mutex<Shared>) {
-    let Ok(actual) = engine.actual_state() else {
-        return;
-    };
+/// Recomputes drift from a fresh snapshot and prunes `rescues` entries
+/// for streams that no longer exist — dead indices would otherwise
+/// accumulate in-session. The snapshot error propagates so the event
+/// loop can mark a dead connection; the previous drift report stays in
+/// place on failure (a transient failure shouldn't blank the UI's
+/// drift list).
+fn update_drift(engine: &PulseEngine, shared: &Mutex<Shared>) -> Result<(), EngineError> {
+    let actual = engine.actual_state()?;
     let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
     shared.drift = detect_drift(shared.store.state(), &actual);
+    shared
+        .rescues
+        .retain(|index, _| actual.sink_inputs.iter().any(|s| s.index == *index));
+    // Deferred `seen_apps` persistence: one disk write per interval
+    // rather than per stream event.
+    if shared.seen_dirty && shared.last_seen_persist.elapsed() >= SEEN_PERSIST_INTERVAL {
+        shared.store.flush();
+        shared.seen_dirty = false;
+        shared.last_seen_persist = Instant::now();
+    }
+    Ok(())
 }
 
 /// Executes one [`Action`]; shared between [`Driver::apply`] (command
@@ -356,6 +523,14 @@ mod tests {
     fn driver_is_send_and_sync() {
         fn assert<T: Send + Sync>() {}
         assert::<Driver>();
+    }
+
+    #[test]
+    fn only_connection_failures_mark_engine_dead() {
+        assert!(is_dead(&EngineError::NotReady));
+        assert!(is_dead(&EngineError::Timeout));
+        assert!(!is_dead(&EngineError::ListFailed));
+        assert!(!is_dead(&EngineError::MoveFailed));
     }
 
     #[test]

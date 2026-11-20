@@ -8,7 +8,9 @@
 //! The manager never fails to construct: when no PulseAudio-compatible
 //! server answers, it still serves persisted desired state (all of it
 //! flagged as drift) and persists mutations; engine-dependent work
-//! returns `Err("audio server unavailable")`.
+//! returns `Err("audio server unavailable")` until the driver's
+//! reconnect lands — the banner's "fio will pick up when it's back" is
+//! load-bearing, not a lie.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,7 +27,8 @@ use crate::model::{
     PersistedState, Route, RouteSource, RouteTarget, Store, VirtualDevice, slugify,
 };
 use crate::reconcile::{
-    Action, Drift, Driver, detect_drift, link_names, link_present, plan_new_stream, plan_startup,
+    Action, Drift, Driver, EngineSlot, detect_drift, link_names, link_present, plan_new_stream,
+    plan_startup,
 };
 
 /// Everything the UI renders in one shot — persisted desired state plus
@@ -57,17 +60,18 @@ fn state_path() -> PathBuf {
     config.join("fio").join("state.json")
 }
 
-/// Owns the app's backend for the duration of the Tauri runtime: one
-/// [`PulseEngine`] connection and the [`Driver`] that reconciles the
-/// store against it. Managed via `.manage()` in `run()`.
+/// Owns the app's backend for the duration of the Tauri runtime: the
+/// shared [`EngineSlot`] the command layer reads (the driver's event
+/// thread clears it on context death and refills it on reconnect) and
+/// the [`Driver`] that reconciles the store against it. Managed via
+/// `.manage()` in `run()`.
 ///
-/// `engine`/`driver`/`store` are tri-state by construction: a live
-/// driver owns the store, so `store` here is `Some` only in the degraded
-/// (no-server) mode where commands still persist mutations.
+/// The driver always runs — degraded mode is simply an empty slot.
+/// Commands persist mutations regardless; engine-dependent work returns
+/// `Err("audio server unavailable")` until a (re)connect lands.
 pub struct Manager {
-    engine: Option<Arc<PulseEngine>>,
-    driver: Option<Driver>,
-    store: Option<Mutex<Store>>,
+    engine: EngineSlot,
+    driver: Driver,
 }
 
 impl Manager {
@@ -81,42 +85,51 @@ impl Manager {
     /// Constructor with an explicit state path — the seam tests (and
     /// any future alternate-config support) use.
     pub fn at_path(path: PathBuf) -> Self {
-        match PulseEngine::start() {
-            Ok(engine) => {
-                let engine = Arc::new(engine);
-                let driver = Driver::new(Store::load(path), Arc::clone(&engine));
-                Self {
-                    engine: Some(engine),
-                    driver: Some(driver),
-                    store: None,
-                }
-            }
+        let engine = match PulseEngine::start() {
+            Ok(engine) => Some(Arc::new(engine)),
             Err(e) => {
                 eprintln!(
                     "fio: audio server unavailable ({e}); starting degraded — \
-                     changes are saved but nothing is applied or enforced"
+                     changes are saved and applied once the server answers"
                 );
-                Self {
-                    engine: None,
-                    driver: None,
-                    store: Some(Mutex::new(Store::load(path))),
-                }
+                None
             }
+        };
+        let slot = Arc::new(Mutex::new(engine));
+        let driver = Driver::new(Store::load(path), Arc::clone(&slot));
+        Self {
+            engine: slot,
+            driver,
         }
     }
 
-    /// Runs `f` against the store — via the driver when live, via the
-    /// manager's own mutex in degraded mode. `f` must never call the
+    /// Clones the live engine `Arc` out of the slot — `None` while the
+    /// server is unreachable. Readers never hold the slot lock across an
+    /// engine call, so a slow snapshot can't stall the reconnect writer.
+    fn engine(&self) -> Option<Arc<PulseEngine>> {
+        self.engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Installs the app handle the driver uses to emit
+    /// `fio-state-changed` when the engine connects or dies —
+    /// connectivity changes aren't driven by a command, so nothing else
+    /// would tell the UI to re-query `ui_state`. Called once from the
+    /// Tauri setup hook.
+    pub fn set_app_handle(&self, app: &AppHandle) {
+        let app = app.clone();
+        self.driver.set_notify(move || {
+            let _ = app.emit("fio-state-changed", ());
+        });
+    }
+
+    /// Runs `f` against the store — always via the driver, which owns it
+    /// whether or not an engine is connected. `f` must never call the
     /// engine.
     fn with_store<R>(&self, f: impl FnOnce(&mut Store) -> R) -> R {
-        match (&self.driver, &self.store) {
-            (Some(driver), _) => driver.with_store(f),
-            (None, Some(store)) => {
-                let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
-                f(&mut store)
-            }
-            (None, None) => unreachable!("manager always holds a store or a driver"),
-        }
+        self.driver.with_store(f)
     }
 
     /// Clone of the persisted desired state (devices, routes, seen apps).
@@ -129,19 +142,18 @@ impl Manager {
     /// trouble shows up as empty live lists and full drift.
     pub fn ui_state(&self) -> UiState {
         let desired = self.desired();
-        let actual = self
-            .engine
+        let engine = self.engine();
+        let actual = engine
             .as_deref()
             .and_then(|e| e.actual_state().ok())
             .unwrap_or_default();
-        let default_source = self
-            .engine
+        let default_source = engine
             .as_deref()
             .and_then(|e| e.server_defaults().ok())
             .and_then(|d| d.default_source);
-        let drift = match &self.driver {
-            Some(driver) => driver.drift(),
-            // No driver: report drift ourselves — with no server,
+        let drift = match &engine {
+            Some(_) => self.driver.drift(),
+            // No connection: report drift ourselves — with no server,
             // everything desired is by definition missing.
             None => detect_drift(&desired, &actual),
         };
@@ -164,7 +176,7 @@ impl Manager {
     pub fn create_device(&self, name: String) -> Result<VirtualDevice, String> {
         validate_device_name(&name)?;
         let device = self.with_store(|store| store.add_device(name.trim().to_string()));
-        if let Some(engine) = self.engine.as_deref()
+        if let Some(engine) = self.engine()
             && let Err(e) = engine.load_module(
                 "module-null-sink",
                 &null_sink_args(&device.name, &device.slug),
@@ -219,18 +231,18 @@ impl Manager {
         // mutation. Committing the removal while the sink and its
         // loopbacks stay loaded on the server would orphan them
         // invisibly — drift only reports desired-missing-from-actual.
-        if let Some(engine) = self.engine.as_deref() {
+        if let Some(engine) = self.engine() {
             let actual = engine
                 .actual_state()
                 .map_err(|e| format!("failed to snapshot audio server state: {e}"))?;
-            self.rescue_streams(engine, &actual, &sink_name);
+            self.rescue_streams(&engine, &actual, &sink_name);
             for (source, sink) in &doomed_links {
-                unload_loopback(engine, &actual, source, sink);
+                unload_loopback(&engine, &actual, source, sink);
             }
             // Unload failure leaves the sink live while the store
             // would forget the device — orphaning it. Abort instead;
             // the user can retry.
-            unload_null_sink(engine, &actual, &sink_name)
+            unload_null_sink(&engine, &actual, &sink_name)
                 .map_err(|e| format!("failed to unload {sink_name}: {e}"))?;
         }
 
@@ -258,11 +270,7 @@ impl Manager {
             return;
         }
 
-        let rescues = self
-            .driver
-            .as_ref()
-            .map(Driver::rescues)
-            .unwrap_or_default();
+        let rescues = self.driver.rescues();
         let default_sink = engine.server_defaults().ok().and_then(|d| d.default_sink);
 
         for (stream_index, target_name) in
@@ -285,9 +293,7 @@ impl Manager {
             }
             // Consumed either way: the entry is per-session bookkeeping
             // for a stream that's rescued or already gone.
-            if let Some(driver) = &self.driver {
-                driver.take_rescue(stream_index);
-            }
+            self.driver.take_rescue(stream_index);
         }
     }
 
@@ -302,7 +308,7 @@ impl Manager {
         let desired = self.desired();
         validate_route(&desired, &source, &target)?;
         let route = self.with_store(|store| store.add_route(source, target));
-        if let (Some(engine), Some(driver)) = (self.engine.as_deref(), self.driver.as_ref())
+        if let Some(engine) = self.engine()
             && let Ok(actual) = engine.actual_state()
         {
             let desired = self.desired();
@@ -310,11 +316,11 @@ impl Manager {
                 RouteSource::AppName(_) => {
                     for stream in &actual.sink_inputs {
                         if let Some(action) = plan_new_stream(stream, &desired, &actual) {
-                            let _ = driver.apply(action);
+                            let _ = self.driver.apply(action);
                         }
                     }
                 }
-                _ => enforce_link_route(driver, &desired, &actual, &route),
+                _ => enforce_link_route(&self.driver, &desired, &actual, &route),
             }
         }
         Ok(route)
@@ -336,8 +342,8 @@ impl Manager {
         // unreachable must bail here — committing the removal while a
         // live module-loopback keeps streaming would orphan it
         // invisibly (same reason as delete_device).
-        let actual = self
-            .engine
+        let engine = self.engine();
+        let actual = engine
             .as_deref()
             .map(PulseEngine::actual_state)
             .transpose()
@@ -346,7 +352,7 @@ impl Manager {
         self.with_store(|store| {
             store.remove_route(id);
         });
-        if let (Some(engine), Some(actual)) = (self.engine.as_deref(), actual.as_ref()) {
+        if let (Some(engine), Some(actual)) = (engine.as_deref(), actual.as_ref()) {
             // Link names resolve fine after removal: only the route is
             // gone — the devices it referenced still exist.
             let desired = self.desired();
@@ -372,8 +378,7 @@ impl Manager {
             })
             .ok_or_else(|| format!("no such device: {device_id}"))?;
         let monitor = format!("fio-{}.monitor", device.slug);
-        self.engine
-            .as_deref()
+        self.engine()
             .ok_or_else(|| "audio server unavailable".to_string())?
             .set_default_source(&monitor)
             .map_err(|e| format!("failed to set {monitor} as default source: {e}"))
@@ -383,25 +388,21 @@ impl Manager {
     /// startup heal — adopts or reloads missing `fio-*` sinks, re-applies
     /// matching rules to live streams, reloads missing loopback links.
     pub fn restore_drift(&self) -> Result<(), String> {
-        let driver = self
-            .driver
-            .as_ref()
+        let engine = self
+            .engine()
             .ok_or_else(|| "audio server unavailable".to_string())?;
-        let engine = self.engine.as_deref().expect("driver implies engine");
         let actual = engine.actual_state().map_err(|e| e.to_string())?;
         for action in plan_startup(&self.desired(), &actual) {
             // Best effort, same as the startup heal — a failed action is
             // reported as drift, not retried here.
-            let _ = driver.apply(action);
+            let _ = self.driver.apply(action);
         }
-        driver.recheck_drift();
+        self.driver.recheck_drift();
         Ok(())
     }
 
     fn recheck_drift(&self) {
-        if let Some(driver) = &self.driver {
-            driver.recheck_drift();
-        }
+        self.driver.recheck_drift();
     }
 }
 
