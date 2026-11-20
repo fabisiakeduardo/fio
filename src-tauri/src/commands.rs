@@ -164,15 +164,24 @@ impl Manager {
     pub fn create_device(&self, name: String) -> Result<VirtualDevice, String> {
         validate_device_name(&name)?;
         let device = self.with_store(|store| store.add_device(name.trim().to_string()));
-        if let Some(engine) = self.engine.as_deref() {
-            engine
-                .load_module(
-                    "module-null-sink",
-                    &null_sink_args(&device.name, &device.slug),
-                )
-                .map_err(|e| format!("device saved but its sink failed to load: {e}"))?;
-            self.recheck_drift();
+        if let Some(engine) = self.engine.as_deref()
+            && let Err(e) = engine.load_module(
+                "module-null-sink",
+                &null_sink_args(&device.name, &device.slug),
+            )
+        {
+            // Roll the store back: the command errors, so no
+            // `fio-state-changed` fires — a persisted-but-unloaded
+            // device would be a ghost the UI never hears about.
+            // (Persisting only after a successful load isn't possible:
+            // the slug must come from `add_device`'s dedup, which IS the
+            // store mutation.)
+            self.with_store(|store| {
+                store.remove_device(device.id);
+            });
+            return Err(format!("device sink failed to load: {e}"));
         }
+        self.recheck_drift();
         Ok(device)
     }
 
@@ -206,9 +215,14 @@ impl Manager {
                 .collect()
         };
 
-        if let Some(engine) = self.engine.as_deref()
-            && let Ok(actual) = engine.actual_state()
-        {
+        // Engine present but snapshot failed: bail BEFORE the store
+        // mutation. Committing the removal while the sink and its
+        // loopbacks stay loaded on the server would orphan them
+        // invisibly — drift only reports desired-missing-from-actual.
+        if let Some(engine) = self.engine.as_deref() {
+            let actual = engine
+                .actual_state()
+                .map_err(|e| format!("failed to snapshot audio server state: {e}"))?;
             self.rescue_streams(engine, &actual, &sink_name);
             for (source, sink) in &doomed_links {
                 unload_loopback(engine, &actual, source, sink);
@@ -307,18 +321,33 @@ impl Manager {
     /// `source=`/`sink=` pair, if loaded. Streams already moved stay
     /// where they are — they're still playing fine.
     pub fn delete_route(&self, id: Uuid) -> Result<(), String> {
+        // Read-only first: a bad id reports "no such route" even when
+        // the server is unreachable — and a nonexistent route needs no
+        // snapshot at all.
         let route = self
-            .with_store(|store| store.remove_route(id))
+            .with_store(|store| store.state().routes.iter().find(|r| r.id == id).cloned())
             .ok_or_else(|| format!("no such route: {id}"))?;
 
-        // Names resolve fine after removal: only the route is gone —
-        // the devices it referenced still exist.
-        if let Some(engine) = self.engine.as_deref() {
+        // Snapshot BEFORE the store mutation: engine present but
+        // unreachable must bail here — committing the removal while a
+        // live module-loopback keeps streaming would orphan it
+        // invisibly (same reason as delete_device).
+        let actual = self
+            .engine
+            .as_deref()
+            .map(PulseEngine::actual_state)
+            .transpose()
+            .map_err(|e| format!("failed to snapshot audio server state: {e}"))?;
+
+        self.with_store(|store| {
+            store.remove_route(id);
+        });
+        if let (Some(engine), Some(actual)) = (self.engine.as_deref(), actual.as_ref()) {
+            // Link names resolve fine after removal: only the route is
+            // gone — the devices it referenced still exist.
             let desired = self.desired();
-            if let (Ok(actual), Some((source, sink))) =
-                (engine.actual_state(), link_names(&desired, &route))
-            {
-                unload_loopback(engine, &actual, &source, &sink);
+            if let Some((source, sink)) = link_names(&desired, &route) {
+                unload_loopback(engine, actual, &source, &sink);
             }
         }
         self.recheck_drift();
