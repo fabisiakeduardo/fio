@@ -12,14 +12,15 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use libpulse_binding::callbacks::ListResult;
+use libpulse_binding::context::introspect;
+use libpulse_binding::context::subscribe::{Facility, InterestMaskSet, Operation};
 use libpulse_binding::context::{self, Context, FlagSet};
 use libpulse_binding::def;
-use libpulse_binding::context::introspect;
 use libpulse_binding::mainloop::api::MainloopInnerType;
 use libpulse_binding::mainloop::threaded::Mainloop;
 
@@ -58,6 +59,14 @@ pub enum EngineError {
     LoadFailed,
     /// `pa_context_unload_module` reported failure.
     UnloadFailed,
+    /// `pa_context_move_sink_input_by_index` reported failure (e.g. the
+    /// stream ended or the sink index is unknown).
+    MoveFailed,
+    /// `pa_context_set_default_source` reported failure.
+    SetDefaultFailed,
+    /// A `sink_name` carried by a plan action resolved to no sink in the
+    /// server's current state.
+    NoSuchSink,
 }
 
 impl fmt::Display for EngineError {
@@ -73,6 +82,9 @@ impl fmt::Display for EngineError {
             Self::ListFailed => "pulse introspection query failed",
             Self::LoadFailed => "pulse module load failed",
             Self::UnloadFailed => "pulse module unload failed",
+            Self::MoveFailed => "pulse stream move failed",
+            Self::SetDefaultFailed => "pulse set-default-source failed",
+            Self::NoSuchSink => "no sink with that name on the server",
         };
         f.write_str(msg)
     }
@@ -139,6 +151,23 @@ impl Drop for PaLock {
     }
 }
 
+/// A server event forwarded over the channel from [`PulseEngine::subscribe`],
+/// distilled from the subscribe callback's (facility, operation, index)
+/// triple to the cases the driver acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PulseEvent {
+    /// `Facility::SinkInput` + `Operation::New`: a playback stream
+    /// appeared. Payload is its server index.
+    NewSinkInput(u32),
+    /// `Facility::Module` + `Operation::Removed`: a module was unloaded
+    /// — possibly by an outside `pactl`, i.e. drift to report. Payload is
+    /// its server index.
+    RemovedModule(u32),
+    /// Anything else under the subscription mask (changes, removals of
+    /// other kinds). The driver treats it as "re-check drift".
+    Other,
+}
+
 /// One live connection to the PulseAudio/PipeWire-pulse server.
 ///
 /// `Send + Sync`: intended to sit in Tauri state and be called from command
@@ -154,8 +183,7 @@ impl PulseEngine {
     /// dropped before the error is returned.
     pub fn start() -> Result<Self, EngineError> {
         let mut mainloop = Mainloop::new().ok_or(EngineError::CreateMainloop)?;
-        let mut context =
-            Context::new(&mainloop, "fio").ok_or(EngineError::CreateContext)?;
+        let mut context = Context::new(&mainloop, "fio").ok_or(EngineError::CreateContext)?;
         context
             .connect(None, FlagSet::NOFLAGS, None)
             .map_err(|_| EngineError::Connect)?;
@@ -396,6 +424,145 @@ impl PulseEngine {
         match ok.load(Ordering::SeqCst) {
             true => Ok(()),
             false => Err(EngineError::UnloadFailed),
+        }
+    }
+
+    /// Subscribes to sink-input and module events and returns the channel
+    /// each event is forwarded to as a [`PulseEvent`].
+    ///
+    /// The subscribe callback runs on the PA mainloop thread, so it does
+    /// exactly one thing: map the event and `Sender::send` it — `send`
+    /// never blocks and never takes the PA lock or `self.inner` (a
+    /// callback re-locking either would deadlock the loop thread).
+    ///
+    /// Only the most recent receiver is live: calling this again replaces
+    /// the context's callback, dropping the earlier `Sender` and
+    /// disconnecting the earlier receiver. When the engine is dropped the
+    /// callback dies with the context, which disconnects the receiver and
+    /// lets a blocking consumer exit. If the context is not `Ready` the
+    /// returned receiver simply never yields events.
+    pub fn subscribe(&self) -> mpsc::Receiver<PulseEvent> {
+        let (tx, rx) = mpsc::channel();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let pa_lock = PaLock::acquire(&mut inner.mainloop);
+        if inner.context.get_state() != context::State::Ready {
+            drop(pa_lock);
+            return rx;
+        }
+        let tml = inner.mainloop._inner.get_ptr();
+
+        inner
+            .context
+            .set_subscribe_callback(Some(Box::new(move |facility, operation, index| {
+                let event = match (facility, operation) {
+                    (Some(Facility::SinkInput), Some(Operation::New)) => {
+                        PulseEvent::NewSinkInput(index)
+                    }
+                    (Some(Facility::Module), Some(Operation::Removed)) => {
+                        PulseEvent::RemovedModule(index)
+                    }
+                    _ => PulseEvent::Other,
+                };
+                // A disconnected receiver is not an error — e.g. the
+                // driver was dropped while the engine lives on.
+                let _ = tx.send(event);
+            })));
+
+        // Wait for the subscribe op itself so a caller can rely on events
+        // being delivered the moment this returns.
+        let done = Arc::new(AtomicBool::new(false));
+        let op = inner
+            .context
+            .subscribe(InterestMaskSet::SINK_INPUT | InterestMaskSet::MODULE, {
+                let done = Arc::clone(&done);
+                move |_success: bool| op_done(&done, tml)
+            });
+        while !done.load(Ordering::SeqCst) {
+            inner.mainloop.wait();
+        }
+        drop(op);
+        drop(pa_lock);
+        rx
+    }
+
+    /// Moves a playback stream (sink-input) onto a different sink, both by
+    /// server index. [`EngineError::MoveFailed`] when the server reports
+    /// failure — e.g. the stream ended or the index is stale.
+    ///
+    /// Same lock → issue → wait → collect pattern as [`Self::load_module`];
+    /// the success callback fires exactly once on the mainloop thread.
+    pub fn move_sink_input(&self, stream_index: u32, sink_index: u32) -> Result<(), EngineError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let pa_lock = PaLock::acquire(&mut inner.mainloop);
+        if inner.context.get_state() != context::State::Ready {
+            drop(pa_lock);
+            return Err(EngineError::NotReady);
+        }
+        let tml = inner.mainloop._inner.get_ptr();
+
+        let ok = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let op = inner.context.introspect().move_sink_input_by_index(
+            stream_index,
+            sink_index,
+            Some(Box::new({
+                let ok = Arc::clone(&ok);
+                let done = Arc::clone(&done);
+                move |success: bool| {
+                    ok.store(success, Ordering::SeqCst);
+                    op_done(&done, tml);
+                }
+            })),
+        );
+        while !done.load(Ordering::SeqCst) {
+            inner.mainloop.wait();
+        }
+        drop(op);
+        drop(pa_lock);
+
+        match ok.load(Ordering::SeqCst) {
+            true => Ok(()),
+            false => Err(EngineError::MoveFailed),
+        }
+    }
+
+    /// Makes `name` the server's default source (the "use as default mic"
+    /// action). [`EngineError::SetDefaultFailed`] when the server reports
+    /// failure, e.g. no such source.
+    ///
+    /// Same lock → issue → wait → collect pattern as [`Self::load_module`].
+    ///
+    /// # Panics
+    /// Panics if `name` contains an interior NUL (the binding unwraps its
+    /// `CString` conversion).
+    pub fn set_default_source(&self, name: &str) -> Result<(), EngineError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let pa_lock = PaLock::acquire(&mut inner.mainloop);
+        if inner.context.get_state() != context::State::Ready {
+            drop(pa_lock);
+            return Err(EngineError::NotReady);
+        }
+        let tml = inner.mainloop._inner.get_ptr();
+
+        let ok = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let op = inner.context.set_default_source(name, {
+            let ok = Arc::clone(&ok);
+            let done = Arc::clone(&done);
+            move |success: bool| {
+                ok.store(success, Ordering::SeqCst);
+                op_done(&done, tml);
+            }
+        });
+        while !done.load(Ordering::SeqCst) {
+            inner.mainloop.wait();
+        }
+        drop(op);
+        drop(pa_lock);
+
+        match ok.load(Ordering::SeqCst) {
+            true => Ok(()),
+            false => Err(EngineError::SetDefaultFailed),
         }
     }
 
