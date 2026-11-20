@@ -10,10 +10,12 @@ depends=(
   'libpulse'
   'webkit2gtk-4.1'
   'gtk3'
+  'libayatana-appindicator' # tray icon — dlopen'd by libappindicator-sys, which
+                            # panics (→ SIGABRT under panic="abort") when absent;
+                            # the tray is core (hide-to-tray on close), not optional.
 )
 optdepends=(
   'pipewire-pulse: PulseAudio-compatible audio server (or pulseaudio)'
-  'libayatana-appindicator: system tray icon (or libappindicator)'
 )
 makedepends=('cargo' 'npm' 'git')
 # Local-repo source: clones this checkout's committed state, so `makepkg -s`
