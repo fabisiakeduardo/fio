@@ -191,7 +191,7 @@
 
     {#if empty}
       <p class="none">
-        nothing unrouted right now — type an app name below to write a rule
+        nothing unrouted right now. Type an app name below to write a rule
       </p>
     {/if}
   </div>
@@ -205,7 +205,7 @@
   >
     <input
       aria-label="app name rule"
-      placeholder="app name — e.g. discord"
+      placeholder="app name, e.g. discord"
       bind:value={newApp}
     />
     <button class="primary" type="submit" disabled={newApp.trim() === ""}>

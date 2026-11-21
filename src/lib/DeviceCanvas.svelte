@@ -297,7 +297,7 @@
       {#if addOpen}
         <AddSource {ui} {device} onclose={() => (addOpen = false)} />
       {:else if routesIn.length === 0}
-        <p class="quiet">nothing routed in yet — press + to add a source</p>
+        <p class="quiet">nothing routed in yet. Press + to add a source</p>
       {/if}
     </section>
 
@@ -431,7 +431,7 @@
           </div>
         {:else}
           {#if !monOpen}
-            <p class="quiet">not monitored — output is silent to you</p>
+            <p class="quiet">not monitored, so the output is silent to you</p>
           {/if}
         {/each}
       {:else}

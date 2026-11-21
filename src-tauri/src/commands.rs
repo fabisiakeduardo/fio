@@ -89,7 +89,7 @@ impl Manager {
             Ok(engine) => Some(Arc::new(engine)),
             Err(e) => {
                 eprintln!(
-                    "fio: audio server unavailable ({e}); starting degraded — \
+                    "fio: audio server unavailable ({e}); starting degraded. \
                      changes are saved and applied once the server answers"
                 );
                 None

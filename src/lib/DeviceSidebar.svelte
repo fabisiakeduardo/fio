@@ -65,7 +65,7 @@
       <p class="empty">loading…</p>
     {:else if ui.devices.length === 0}
       <p class="empty">
-        no devices yet — each one appears as a speaker and a mic in your
+        no devices yet. Each one appears as a speaker and a mic in your
         audio settings
       </p>
     {:else}
@@ -147,7 +147,7 @@
       >
         <input
           aria-label="new device name"
-          placeholder="Name — e.g. Game, Chat"
+          placeholder="e.g. Game, Chat"
           bind:value={newName}
         />
         <button class="primary" type="submit" disabled={newName.trim() === ""}>

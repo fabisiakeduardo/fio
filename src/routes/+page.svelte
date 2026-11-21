@@ -68,7 +68,7 @@
     {#if serverOffline}
       <aside class="drift offline" role="alert">
         <strong class="drift-title">
-          the audio server isn't answering — fio will pick up when it's back
+          the audio server isn't answering. fio picks up when it's back
         </strong>
       </aside>
     {/if}
@@ -109,7 +109,7 @@
           </svg>
           <p class="blank-title">no virtual devices yet</p>
           <p class="blank-sub">
-            press <span class="kbd">+</span> in the sidebar — each device shows
+            press <span class="kbd">+</span> in the sidebar. Each device shows
             up as a speaker (<span class="mono">fio-*</span>) and a mic (<span
               class="mono">fio-*.monitor</span
             >) in your audio settings

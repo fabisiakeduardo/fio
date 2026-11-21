@@ -80,7 +80,7 @@
     <optgroup label="Virtual devices">
       {#each devices as opt (opt.key)}
         <option value={opt.key} disabled={opt.disabled}>
-          {opt.label}{opt.hint ? ` (${opt.hint})` : ""}{opt.disabled ? " — routed" : ""}
+          {opt.label}{opt.hint ? ` (${opt.hint})` : ""}{opt.disabled ? " (routed)" : ""}
         </option>
       {/each}
     </optgroup>
@@ -89,7 +89,7 @@
     <optgroup label="Physical outputs">
       {#each sinks as opt (opt.key)}
         <option value={opt.key} disabled={opt.disabled}>
-          {opt.label}{opt.hint ? ` (${opt.hint})` : ""}{opt.disabled ? " — routed" : ""}
+          {opt.label}{opt.hint ? ` (${opt.hint})` : ""}{opt.disabled ? " (routed)" : ""}
         </option>
       {/each}
     </optgroup>

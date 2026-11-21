@@ -25,7 +25,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     // don't have, and no distro hits it in practice.
     #[cfg(target_os = "linux")]
     if !appindicator_available() {
-        return Err("no libayatana-appindicator on this host — tray skipped".into());
+        return Err("no libayatana-appindicator on this host; tray skipped".into());
     }
 
     let menu = Menu::new(app)?;
@@ -68,7 +68,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("bundle icons are not configured")?;
     TrayIconBuilder::with_id("fio")
         .icon(icon)
-        .tooltip("Fio — virtual audio patchbay")
+        .tooltip("Fio: virtual audio patchbay")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => show_main_window(app),

@@ -145,6 +145,6 @@ export function driftMessage(d: Drift, ui: UiState): string {
   );
   const label = route ? routeLabel(route, ui) : "unknown route";
   return "MissingTarget" in d
-    ? `route end not on the server — ${label}`
-    : `loopback link not loaded — ${label}`;
+    ? `route end not on the server: ${label}`
+    : `loopback link not loaded: ${label}`;
 }
