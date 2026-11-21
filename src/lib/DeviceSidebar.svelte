@@ -58,42 +58,7 @@
 
   <div class="list-head">
     <span class="sec-label">Devices</span>
-    <button
-      class="plus"
-      aria-label="new virtual device"
-      title="new virtual device"
-      onclick={openAdd}
-    >
-      <svg viewBox="0 0 12 12" width="11" height="11" aria-hidden="true">
-        <path
-          d="M6 1.5v9M1.5 6h9"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.6"
-          stroke-linecap="round"
-        />
-      </svg>
-    </button>
   </div>
-
-  {#if adding}
-    <form
-      class="new-row"
-      onsubmit={(e) => {
-        e.preventDefault();
-        submit();
-      }}
-    >
-      <input
-        aria-label="new device name"
-        placeholder="Name — e.g. Game, Chat"
-        bind:value={newName}
-      />
-      <button class="primary" type="submit" disabled={newName.trim() === ""}>
-        add
-      </button>
-    </form>
-  {/if}
 
   <nav class="list">
     {#if !ui}
@@ -121,8 +86,6 @@
               <svg
                 class="dev-icon"
                 viewBox="0 0 14 14"
-                width="14"
-                height="14"
                 aria-hidden="true"
               >
                 <rect
@@ -173,9 +136,49 @@
     {/if}
   </nav>
 
-  {#if counts}
-    <footer class="rail-foot">{counts}</footer>
-  {/if}
+  <footer class="rail-foot">
+    {#if adding}
+      <form
+        class="new-row"
+        onsubmit={(e) => {
+          e.preventDefault();
+          submit();
+        }}
+      >
+        <input
+          aria-label="new device name"
+          placeholder="Name — e.g. Game, Chat"
+          bind:value={newName}
+        />
+        <button class="primary" type="submit" disabled={newName.trim() === ""}>
+          add
+        </button>
+        <button
+          type="button"
+          aria-label="cancel"
+          onclick={() => (adding = false)}
+        >
+          ×
+        </button>
+      </form>
+    {:else}
+      <button class="new-dev" onclick={openAdd}>
+        <svg viewBox="0 0 12 12" width="11" height="11" aria-hidden="true">
+          <path
+            d="M6 1.5v9M1.5 6h9"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+          />
+        </svg>
+        New Virtual Device
+      </button>
+    {/if}
+    {#if counts}
+      <p class="counts">{counts}</p>
+    {/if}
+  </footer>
 </aside>
 
 <style>
@@ -216,21 +219,10 @@
     padding: 14px 14px 6px;
   }
 
-  .plus {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 22px;
-    height: 22px;
-    padding: 0;
-    border-radius: 6px;
-    color: var(--text-dim);
-  }
-
   .new-row {
     display: flex;
     gap: 6px;
-    padding: 4px 10px 8px;
+    align-items: center;
   }
 
   .new-row input {
@@ -291,11 +283,19 @@
 
   .dev-icon {
     flex: none;
+    width: 22px;
+    height: 22px;
+    padding: 4px;
+    border-radius: 6px;
+    background: var(--block);
+    border: 1px solid var(--border-soft);
     color: var(--text-faint);
   }
 
   .row.sel .dev-icon {
     color: var(--accent);
+    background: var(--accent-soft);
+    border-color: var(--accent-ring);
   }
 
   .row-text {
@@ -387,8 +387,36 @@
   }
 
   .rail-foot {
-    padding: 8px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 10px 8px;
     border-top: 1px solid var(--border-soft);
+  }
+
+  .new-dev {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    width: 100%;
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-dim);
+    background: transparent;
+    border-color: var(--border-soft);
+  }
+
+  .new-dev:hover:not(:disabled) {
+    background: var(--block);
+    color: var(--text);
+    border-color: var(--border);
+  }
+
+  .counts {
+    margin: 0;
+    padding: 0 4px;
     font-size: 10.5px;
     color: var(--text-faint);
     white-space: nowrap;

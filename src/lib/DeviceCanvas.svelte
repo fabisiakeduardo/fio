@@ -1,17 +1,20 @@
 <script lang="ts">
   /**
-   * The Loopback canvas: the selected virtual device drawn as one large
-   * rounded block. Sources are coloured blocks on the left; the Output
-   * Channels block on the right carries the stereo L/R strips; bezier
-   * wires in each source's accent fan into both channels. A Monitors
-   * strip underneath holds the device's monitor feeds and the
-   * default-mic action.
+   * The Loopback-style patchbay for the selected device: three columns —
+   * Sources, Output Channels, Monitors — wired channel-row → channel-row
+   * with teal cubic béziers. Each routed source is a white card carrying
+   * "1 (L)" / "2 (R)" rows with a wire anchor on the right edge. The
+   * device is stereo, so Output Channels is a single "Channels 1 & 2"
+   * pair card with anchors on both sides; every monitor feed (this
+   * device's VirtualMonitor → a target) is a card whose channel rows
+   * take wires from the output pair's right-hand anchors.
    */
   import { onMount, tick } from "svelte";
+  import type { Attachment } from "svelte/attachments";
   import AddSource from "./AddSource.svelte";
   import RouteForm from "./RouteForm.svelte";
   import { createRoute, deleteRoute, setDefaultMic } from "./fio.svelte";
-  import { kindLabel, sourceAccent } from "./accents";
+  import { kindLabel, sourceAccent, sourceKind } from "./accents";
   import {
     deviceDrifted,
     monitorName,
@@ -31,6 +34,8 @@
   let { ui, device }: Props = $props();
 
   let addOpen = $state(false);
+  let monOpen = $state(false);
+  let monHidden = $state(false);
 
   const monitor = $derived(monitorName(device));
   const isDefaultMic = $derived(ui.default_source === monitor);
@@ -48,68 +53,86 @@
   );
 
   function feedMonitor(target: RouteTarget) {
-    void createRoute({ VirtualMonitor: device.id }, target);
+    void createRoute({ VirtualMonitor: device.id }, target).then((ok) => {
+      if (ok) monOpen = false;
+    });
   }
 
-  /* ------- wires ------- */
+  /* ------- wires: channel-row anchor → channel-row anchor ------- */
 
   interface Wire {
     key: string;
     d: string;
-    color: string;
+    x1: number;
+    y1: number;
     x2: number;
     y2: number;
   }
 
   let patchEl = $state<HTMLDivElement | null>(null);
-  const srcEls = new Map<string, HTMLElement>();
-  let stripL = $state<HTMLElement | null>(null);
-  let stripR = $state<HTMLElement | null>(null);
+  /** Live anchor dots, keyed `s:{routeId}:{ch}` / `o:{in|out}:{ch}` / `m:{routeId}:{ch}`. */
+  const ports = new Map<string, HTMLElement>();
   let wires = $state<Wire[]>([]);
   let wireBox = $state({ w: 0, h: 0 });
+
+  const port =
+    (key: string): Attachment<HTMLElement> =>
+    (el) => {
+      ports.set(key, el);
+      return () => {
+        ports.delete(key);
+      };
+    };
 
   function measure() {
     const host = patchEl;
     if (!host) return;
     const hr = host.getBoundingClientRect();
     wireBox = { w: hr.width, h: hr.height };
-    const strips = [stripL, stripR].filter((s): s is HTMLElement => s != null);
+    const pt = (key: string) => {
+      const el = ports.get(key);
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return {
+        x: r.left + r.width / 2 - hr.left,
+        y: r.top + r.height / 2 - hr.top,
+      };
+    };
     const out: Wire[] = [];
-    const n = routesIn.length;
-    routesIn.forEach((r, i) => {
-      const el = srcEls.get(r.id);
-      if (!el) return;
-      const sr = el.getBoundingClientRect();
-      const x1 = sr.right - hr.left;
-      const y1 = sr.top + sr.height / 2 - hr.top;
-      const color = sourceAccent(r.source).base;
-      strips.forEach((st, j) => {
-        const tr = st.getBoundingClientRect();
-        const pad = Math.min(16, tr.height * 0.14);
-        const y2 =
-          tr.top + pad + ((tr.height - pad * 2) * (i + 1)) / (n + 1) - hr.top;
-        const x2 = tr.left - hr.left + 1;
-        const c = Math.max(30, (x2 - x1) * 0.55);
-        out.push({
-          key: `${r.id}-${j}`,
-          d: `M ${x1} ${y1} C ${x1 + c} ${y1}, ${x2 - c} ${y2}, ${x2} ${y2}`,
-          color,
-          x2,
-          y2,
-        });
+    const wire = (key: string, a: { x: number; y: number } | null, b: { x: number; y: number } | null) => {
+      if (!a || !b) return;
+      const c = Math.max(24, Math.abs(b.x - a.x) * 0.5);
+      out.push({
+        key,
+        d: `M ${a.x} ${a.y} C ${a.x + c} ${a.y}, ${b.x - c} ${b.y}, ${b.x} ${b.y}`,
+        x1: a.x,
+        y1: a.y,
+        x2: b.x,
+        y2: b.y,
       });
-    });
+    };
+    // source channel rows → output pair's left anchors
+    for (const r of routesIn) {
+      wire(`${r.id}-l`, pt(`s:${r.id}:0`), pt("o:in:0"));
+      wire(`${r.id}-r`, pt(`s:${r.id}:1`), pt("o:in:1"));
+    }
+    // output pair's right anchors → each monitor card's rows
+    for (const r of monitorRoutes) {
+      wire(`m-${r.id}-l`, pt("o:out:0"), pt(`m:${r.id}:0`));
+      wire(`m-${r.id}-r`, pt("o:out:1"), pt(`m:${r.id}:1`));
+    }
     wires = out;
   }
 
   $effect(() => {
     // Re-measure whenever anything that moves the geometry changes.
     routesIn.length;
+    monitorRoutes.length;
     device.id;
     addOpen;
+    monOpen;
+    monHidden;
     ui;
-    stripL;
-    stripR;
     void tick().then(() => requestAnimationFrame(measure));
   });
 
@@ -122,39 +145,8 @@
 
 <article class="devblock" class:missing>
   <header class="dev-head">
-    <div class="dev-id">
-      <svg
-        class="dev-glyph"
-        viewBox="0 0 20 20"
-        width="22"
-        height="22"
-        aria-hidden="true"
-      >
-        <rect
-          x="1.5"
-          y="1.5"
-          width="17"
-          height="17"
-          rx="4.5"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.4"
-        />
-        <path
-          d="M6.4 13.4V8.8M10 14.6V5.6M13.6 12.4V7.8"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.4"
-          stroke-linecap="round"
-        />
-      </svg>
-      <div class="dev-names">
-        <h2 class="dev-name">{device.name}</h2>
-        <p class="dev-nodes mono">
-          {sinkName(device)} · {monitor}
-        </p>
-      </div>
-    </div>
+    <h2 class="dev-name">{device.name}</h2>
+    <p class="dev-nodes mono">{sinkName(device)} · {monitor}</p>
     {#if missing}
       <span class="pill warn">missing from server</span>
     {/if}
@@ -169,65 +161,29 @@
       aria-hidden="true"
     >
       {#each wires as w (w.key)}
-        <path d={w.d} fill="none" stroke={w.color} stroke-width="2.2" />
-        <circle cx={w.x2} cy={w.y2} r="3" fill={w.color} />
+        <path d={w.d} fill="none" stroke="var(--wire)" stroke-width="1.8" />
+        <circle cx={w.x1} cy={w.y1} r="2.4" fill="var(--wire)" />
+        <circle cx={w.x2} cy={w.y2} r="2.4" fill="var(--wire)" />
       {/each}
     </svg>
 
-    <section class="sources" aria-label="sources">
-      <div class="sec-head">
-        <h3 class="sec-label">Sources</h3>
-        {#if routesIn.length > 0}
-          <span class="count">{routesIn.length}</span>
-        {/if}
-      </div>
-
-      {#if routesIn.length === 0 && !addOpen}
-        <p class="quiet">nothing routed in yet</p>
-      {/if}
-
-      {#each routesIn as r (r.id)}
-        {@const accent = sourceAccent(r.source)}
-        {@const drift = routeDrift(ui, r.id)}
-        <div
-          class="src"
-          class:drifted={drift !== null}
-          style="--src:{accent.base}"
-          {@attach (el: HTMLElement) => {
-            srcEls.set(r.id, el);
-            return () => srcEls.delete(r.id);
-          }}
-        >
-          <div class="src-main">
-            <span class="src-name">{sourceLabel(r.source, ui)}</span>
-            <span class="src-kind">{kindLabel(r.source)}</span>
-          </div>
-          {#if drift}
-            <span class="src-drift">{drift}</span>
-          {/if}
-          <button
-            class="src-x"
-            aria-label="delete route {sourceLabel(r.source, ui)}"
-            title="delete route"
-            onclick={() => void deleteRoute(r.id)}
-          >
-            <svg viewBox="0 0 10 10" width="9" height="9" aria-hidden="true">
-              <path
-                d="M1.5 1.5l7 7M8.5 1.5l-7 7"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.5"
-                stroke-linecap="round"
-              />
-            </svg>
-          </button>
+    <section class="col" aria-label="sources">
+      <div class="col-head">
+        <div class="col-titles">
+          <h3 class="col-title">Sources</h3>
+          <span class="col-sub">
+            {routesIn.length === 0
+              ? "none routed"
+              : `${routesIn.length} routed`}
+          </span>
         </div>
-      {/each}
-
-      {#if addOpen}
-        <AddSource {ui} {device} onclose={() => (addOpen = false)} />
-      {:else}
-        <button class="add-src" onclick={() => (addOpen = true)}>
+        <button
+          class="col-plus"
+          class:open={addOpen}
+          aria-label="add source"
+          title="add source"
+          onclick={() => (addOpen = !addOpen)}
+        >
           <svg viewBox="0 0 12 12" width="11" height="11" aria-hidden="true">
             <path
               d="M6 1.5v9M1.5 6h9"
@@ -237,25 +193,140 @@
               stroke-linecap="round"
             />
           </svg>
-          add source
         </button>
+      </div>
+
+      {#each routesIn as r (r.id)}
+        {@const accent = sourceAccent(r.source)}
+        {@const kind = sourceKind(r.source)}
+        {@const drift = routeDrift(ui, r.id)}
+        <div
+          class="card src"
+          class:drifted={drift !== null}
+          style="--a:{accent.base}; --as:{accent.soft}"
+        >
+          <div class="card-head">
+            <span class="src-ic" aria-hidden="true">
+              {#if kind === "app"}
+                <svg viewBox="0 0 14 14" width="14" height="14">
+                  <rect
+                    x="1.8"
+                    y="1.8"
+                    width="10.4"
+                    height="10.4"
+                    rx="2.4"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.2"
+                  />
+                  <path
+                    d="M1.8 4.6h10.4"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.2"
+                  />
+                  <circle cx="3.6" cy="3.2" r="0.7" fill="currentColor" />
+                </svg>
+              {:else if kind === "capture"}
+                <svg viewBox="0 0 14 14" width="14" height="14">
+                  <rect
+                    x="5"
+                    y="1.6"
+                    width="4"
+                    height="6.8"
+                    rx="2"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.2"
+                  />
+                  <path
+                    d="M3.2 7.4a3.8 3.8 0 0 0 7.6 0M7 11.2v1.6M5 12.8h4"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.2"
+                    stroke-linecap="round"
+                  />
+                </svg>
+              {:else}
+                <svg viewBox="0 0 14 14" width="14" height="14">
+                  <path
+                    d="M2.6 9V7a4.4 4.4 0 0 1 8.8 0v2M2 9h2.6v3H2zM9.4 9H12v3H9.4z"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.2"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              {/if}
+            </span>
+            <div class="card-names">
+              <span class="card-name">{sourceLabel(r.source, ui)}</span>
+              <span class="card-kind">{kindLabel(r.source)}</span>
+            </div>
+            {#if drift}
+              <span class="src-drift">{drift}</span>
+            {/if}
+            <button
+              class="card-x"
+              aria-label="delete route {sourceLabel(r.source, ui)}"
+              title="delete route"
+              onclick={() => void deleteRoute(r.id)}
+            >
+              <svg viewBox="0 0 10 10" width="9" height="9" aria-hidden="true">
+                <path
+                  d="M1.5 1.5l7 7M8.5 1.5l-7 7"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </button>
+          </div>
+          <div class="ch-row">
+            <span class="ch-label">1 (L)</span>
+            <span class="ch-bar"></span>
+            <span class="port" {@attach port(`s:${r.id}:0`)}></span>
+          </div>
+          <div class="ch-row">
+            <span class="ch-label">2 (R)</span>
+            <span class="ch-bar"></span>
+            <span class="port" {@attach port(`s:${r.id}:1`)}></span>
+          </div>
+        </div>
+      {/each}
+
+      {#if addOpen}
+        <AddSource {ui} {device} onclose={() => (addOpen = false)} />
+      {:else if routesIn.length === 0}
+        <p class="quiet">nothing routed in yet — press + to add a source</p>
       {/if}
     </section>
 
-    <section class="outblock" aria-label="output channels">
-      <div class="sec-head">
-        <h3 class="sec-label">Output Channels</h3>
-      </div>
-      <div class="strips">
-        <div class="strip" bind:this={stripL}>
-          <span class="ch-num">1</span>
-          <span class="ch-side">L</span>
-        </div>
-        <div class="strip" bind:this={stripR}>
-          <span class="ch-num">2</span>
-          <span class="ch-side">R</span>
+    <section class="col" aria-label="output channels">
+      <div class="col-head">
+        <div class="col-titles">
+          <h3 class="col-title">Output Channels</h3>
+          <span class="col-sub">2 channels</span>
         </div>
       </div>
+
+      <div class="card pair">
+        <div class="pair-head">Channels 1 &amp; 2</div>
+        <div class="ch-row">
+          <span class="port" {@attach port("o:in:0")}></span>
+          <span class="ch-label">Channel 1 (L)</span>
+          <span class="ch-bar"></span>
+          <span class="port" {@attach port("o:out:0")}></span>
+        </div>
+        <div class="ch-row">
+          <span class="port" {@attach port("o:in:1")}></span>
+          <span class="ch-label">Channel 2 (R)</span>
+          <span class="ch-bar"></span>
+          <span class="port" {@attach port("o:out:1")}></span>
+        </div>
+      </div>
+
       <div class="nodes">
         <div class="node">
           <span class="node-kind">sink</span>
@@ -267,137 +338,156 @@
         </div>
       </div>
     </section>
-  </div>
 
-  <footer class="monitors">
-    <div class="sec-head">
-      <h3 class="sec-label">Monitors</h3>
-    </div>
-    <div class="mon-row">
-      {#if monitorRoutes.length === 0}
-        <span class="quiet">not monitored — output is silent to you</span>
-      {:else}
+    <section class="col" aria-label="monitors">
+      <div class="col-head">
+        <div class="col-titles">
+          <h3 class="col-title">Monitors</h3>
+          <span class="col-sub">
+            {monitorRoutes.length === 0
+              ? "none"
+              : `${monitorRoutes.length} device${monitorRoutes.length === 1 ? "" : "s"}`}
+          </span>
+        </div>
+        <button
+          class="col-plus"
+          class:open={monOpen}
+          aria-label="add monitor"
+          title="monitor this device through an output"
+          onclick={() => (monOpen = !monOpen)}
+        >
+          <svg viewBox="0 0 12 12" width="11" height="11" aria-hidden="true">
+            <path
+              d="M6 1.5v9M1.5 6h9"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+            />
+          </svg>
+        </button>
+      </div>
+
+      {#if monOpen}
+        <div class="mon-add">
+          <RouteForm
+            {ui}
+            source={{ VirtualMonitor: device.id }}
+            exclude={[{ VirtualDevice: device.id }]}
+            placeholder="monitor through…"
+            onroute={feedMonitor}
+          />
+        </div>
+      {/if}
+
+      {#if !monHidden}
         {#each monitorRoutes as r (r.id)}
           {@const drift = routeDrift(ui, r.id)}
-          <span class="mon-chip" class:drifted={drift !== null}>
-            <svg
-              viewBox="0 0 12 12"
-              width="10"
-              height="10"
-              aria-hidden="true"
-              class="mon-ic"
-            >
-              <path
-                d="M2 8.5V6a4 4 0 0 1 8 0v2.5M1.6 8.5h2.4v2H1.6zM8 8.5h2.4v2H8z"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.2"
-                stroke-linejoin="round"
-              />
-            </svg>
-            {targetLabel(r.target, ui)}
-            {#if drift}
-              <span class="chip-drift">{drift}</span>
-            {/if}
-            <button
-              class="chip-x"
-              aria-label="delete monitor feed to {targetLabel(r.target, ui)}"
-              title="delete route"
-              onclick={() => void deleteRoute(r.id)}
-            >
-              <svg viewBox="0 0 10 10" width="8" height="8" aria-hidden="true">
-                <path
-                  d="M1.5 1.5l7 7M8.5 1.5l-7 7"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.5"
-                  stroke-linecap="round"
-                />
-              </svg>
-            </button>
-          </span>
+          <div class="card mon" class:drifted={drift !== null}>
+            <div class="card-head">
+              <span class="mon-ic" aria-hidden="true">
+                <svg viewBox="0 0 14 14" width="13" height="13">
+                  <path
+                    d="M2.6 9V7a4.4 4.4 0 0 1 8.8 0v2M2 9h2.6v3H2zM9.4 9H12v3H9.4z"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.2"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </span>
+              <div class="card-names">
+                <span class="card-name">{targetLabel(r.target, ui)}</span>
+                <span class="card-kind">monitor feed</span>
+              </div>
+              {#if drift}
+                <span class="src-drift">{drift}</span>
+              {/if}
+              <button
+                class="card-x"
+                aria-label="delete monitor feed to {targetLabel(r.target, ui)}"
+                title="delete route"
+                onclick={() => void deleteRoute(r.id)}
+              >
+                <svg viewBox="0 0 10 10" width="9" height="9" aria-hidden="true">
+                  <path
+                    d="M1.5 1.5l7 7M8.5 1.5l-7 7"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                  />
+                </svg>
+              </button>
+            </div>
+            <div class="ch-row">
+              <span class="port" {@attach port(`m:${r.id}:0`)}></span>
+              <span class="ch-label">Channel 1 (L)</span>
+              <span class="ch-bar"></span>
+            </div>
+            <div class="ch-row">
+              <span class="port" {@attach port(`m:${r.id}:1`)}></span>
+              <span class="ch-label">Channel 2 (R)</span>
+              <span class="ch-bar"></span>
+            </div>
+          </div>
+        {:else}
+          {#if !monOpen}
+            <p class="quiet">not monitored — output is silent to you</p>
+          {/if}
         {/each}
-      {/if}
-
-      <RouteForm
-        {ui}
-        source={{ VirtualMonitor: device.id }}
-        exclude={[{ VirtualDevice: device.id }]}
-        placeholder="monitor through…"
-        onroute={feedMonitor}
-      />
-
-      <span class="mon-spacer"></span>
-
-      {#if isDefaultMic}
-        <span class="pill accent">default mic</span>
       {:else}
-        <button onclick={() => void setDefaultMic(device.id)}>
-          use as default mic
-        </button>
+        <p class="quiet">monitors hidden</p>
       {/if}
-    </div>
+    </section>
+  </div>
+
+  <footer class="dev-foot">
+    {#if isDefaultMic}
+      <span class="pill accent">default mic</span>
+    {:else}
+      <button class="ghost" onclick={() => void setDefaultMic(device.id)}>
+        use as default mic
+      </button>
+    {/if}
+    <span class="foot-spacer"></span>
+    <button class="ghost" onclick={() => (monHidden = !monHidden)}>
+      {monHidden ? "show monitors" : "hide monitors"}
+    </button>
   </footer>
 </article>
 
 <style>
   .devblock {
-    background: var(--block);
-    border: 1px solid var(--border);
-    border-radius: var(--r-block);
-    box-shadow: var(--shadow-block);
     display: flex;
     flex-direction: column;
     min-width: 0;
   }
 
-  .devblock.missing {
-    border-color: var(--warn-border);
-  }
-
   .dev-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 16px 18px 12px;
-  }
-
-  .dev-id {
-    display: flex;
-    align-items: center;
-    gap: 11px;
-    min-width: 0;
-  }
-
-  .dev-glyph {
-    flex: none;
-    color: var(--accent);
-  }
-
-  .dev-names {
-    min-width: 0;
+    position: relative;
+    text-align: center;
+    padding: 2px 0 14px;
   }
 
   .dev-name {
     margin: 0;
-    font-size: 17px;
+    font-size: 16px;
     font-weight: 650;
     letter-spacing: -0.015em;
     text-wrap: balance;
   }
 
   .dev-nodes {
-    margin: 1px 0 0;
+    margin: 2px 0 0;
     color: var(--text-faint);
     font-size: 10.5px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 
   .dev-head .pill {
-    flex: none;
+    position: absolute;
+    right: 0;
+    top: 2px;
   }
 
   .pill {
@@ -427,90 +517,152 @@
   .patch {
     position: relative;
     display: grid;
-    grid-template-columns: minmax(220px, 1fr) minmax(240px, 0.9fr);
-    gap: 0;
-    padding: 4px 18px 16px;
-    align-items: stretch;
+    grid-template-columns:
+      minmax(200px, 1.05fr) minmax(180px, 0.95fr)
+      minmax(190px, 1fr);
+    column-gap: clamp(34px, 4.5vw, 68px);
+    align-items: start;
   }
 
   .wires {
     position: absolute;
     inset: 0;
     pointer-events: none;
-    z-index: 5;
+    z-index: 6;
     overflow: visible;
   }
 
-  .sec-head {
-    display: flex;
-    align-items: baseline;
-    gap: 7px;
-    margin-bottom: 8px;
-  }
-
-  .count {
-    font-size: 10px;
-    font-weight: 700;
-    color: var(--text-faint);
-    background: var(--block-sunk);
-    border: 1px solid var(--border-soft);
-    border-radius: 999px;
-    padding: 0 6px;
-  }
-
-  .sources {
+  .col {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 10px;
     min-width: 0;
-    padding-right: 64px;
-  }
-
-  .quiet {
-    margin: 2px 0;
-    font-size: 12px;
-    color: var(--text-faint);
-  }
-
-  .src {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    background: var(--src);
-    border-radius: var(--r-inner);
-    padding: 9px 8px 9px 12px;
-    color: #fff;
-    box-shadow: 0 1px 2px rgba(43, 41, 37, 0.18);
     position: relative;
     z-index: 1;
   }
 
-  .src.drifted {
+  .col-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 30px;
+  }
+
+  .col-titles {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    min-width: 0;
+  }
+
+  .col-title {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 650;
+    color: var(--text);
+    white-space: nowrap;
+  }
+
+  .col-sub {
+    font-size: 10.5px;
+    color: var(--text-faint);
+    white-space: nowrap;
+  }
+
+  .col-plus {
+    flex: none;
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 19px;
+    height: 19px;
+    padding: 0;
+    border-radius: 50%;
+    border: 1px solid var(--border);
+    background: var(--block);
+    color: var(--text-dim);
+  }
+
+  .col-plus:hover:not(:disabled),
+  .col-plus.open {
+    border-color: var(--accent);
+    color: var(--accent-deep);
+    background: var(--accent-soft);
+  }
+
+  .card {
+    background: var(--block);
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    box-shadow:
+      0 1px 2px rgba(43, 41, 37, 0.07),
+      0 2px 8px rgba(43, 41, 37, 0.05);
+    padding: 8px 10px 9px;
+    min-width: 0;
+  }
+
+  .card.drifted {
     outline: 2px dashed var(--warn-border);
     outline-offset: 2px;
   }
 
-  .src-main {
+  .card-head {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding-bottom: 6px;
+    min-width: 0;
+  }
+
+  .src-ic {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    background: var(--as);
+    color: var(--a);
+  }
+
+  .mon-ic {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    background: var(--src-monitor-soft);
+    color: var(--src-monitor);
+  }
+
+  .card-names {
     flex: 1;
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 1px;
+    gap: 0;
   }
 
-  .src-name {
+  .card-name {
     font-weight: 650;
-    font-size: 13px;
+    font-size: 12.5px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
-  .src-kind {
-    font-size: 10px;
+  .card-kind {
+    font-size: 9.5px;
     letter-spacing: 0.07em;
     text-transform: uppercase;
-    color: rgba(255, 255, 255, 0.82);
+    color: var(--text-faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .src-drift {
@@ -521,11 +673,11 @@
     text-transform: uppercase;
     padding: 1px 6px;
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.9);
+    background: var(--warn-soft);
     color: var(--warn);
   }
 
-  .src-x {
+  .card-x {
     flex: none;
     display: inline-flex;
     align-items: center;
@@ -535,95 +687,63 @@
     padding: 0;
     border: none;
     border-radius: 50%;
-    background: rgba(255, 255, 255, 0.18);
-    color: #fff;
+    background: transparent;
+    color: var(--text-faint);
   }
 
-  .src-x:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.34);
-    color: #fff;
+  .card-x:hover:not(:disabled) {
+    background: var(--danger-soft);
+    color: var(--danger);
     border: none;
   }
 
-  .add-src {
+  .ch-row {
     display: flex;
     align-items: center;
-    justify-content: center;
-    gap: 7px;
-    padding: 8px 10px;
-    border: 1.5px dashed var(--border);
-    border-radius: var(--r-inner);
-    background: transparent;
-    color: var(--text-dim);
-    font-weight: 600;
-    position: relative;
-    z-index: 1;
+    gap: 8px;
+    padding: 4px 0 4px 2px;
+    border-top: 1px solid var(--border-soft);
   }
 
-  .add-src:hover:not(:disabled) {
-    border-style: dashed;
-    border-color: var(--accent);
-    color: var(--accent-deep);
-    background: var(--accent-soft);
-  }
-
-  .outblock {
-    background: var(--block-sunk);
-    border: 1px solid var(--border-soft);
-    border-radius: var(--r-inner);
-    padding: 12px 14px;
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-    position: relative;
-    z-index: 1;
-  }
-
-  .strips {
-    flex: 1;
-    display: flex;
-    gap: 10px;
-    min-height: 96px;
-  }
-
-  .strip {
+  .ch-label {
     flex: none;
-    width: 66px;
-    background: var(--block);
-    border: 1px solid var(--border-soft);
-    border-radius: 6px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 3px;
-    position: relative;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.4);
-  }
-
-  .ch-num {
-    font-size: 15px;
-    font-weight: 700;
+    font-size: 11px;
     color: var(--text-dim);
+    white-space: nowrap;
   }
 
-  .ch-side {
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    color: var(--text-faint);
-    border: 1px solid var(--border);
+  .ch-bar {
+    flex: 1;
+    height: 7px;
     border-radius: 4px;
-    padding: 0 4px;
+    background: var(--border-soft);
+  }
+
+  .port {
+    flex: none;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--block);
+    border: 2px solid var(--wire);
+  }
+
+  .quiet {
+    margin: 2px 0;
+    font-size: 12px;
+    color: var(--text-faint);
+  }
+
+  .pair-head {
+    font-size: 12px;
+    font-weight: 650;
+    padding-bottom: 6px;
   }
 
   .nodes {
     display: flex;
     flex-direction: column;
     gap: 3px;
-    margin-top: 10px;
-    padding-top: 9px;
-    border-top: 1px solid var(--border-soft);
   }
 
   .node {
@@ -651,74 +771,40 @@
     text-overflow: ellipsis;
   }
 
-  .monitors {
-    border-top: 1px solid var(--border-soft);
-    padding: 12px 18px 14px;
+  .mon-add {
+    padding: 8px 10px;
+    background: var(--block);
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    box-shadow:
+      0 1px 2px rgba(43, 41, 37, 0.07),
+      0 2px 8px rgba(43, 41, 37, 0.05);
   }
 
-  .mon-row {
+  .mon-add :global(.route-select) {
+    width: 100%;
+  }
+
+  .dev-foot {
     display: flex;
     align-items: center;
-    flex-wrap: wrap;
-    gap: 8px;
+    gap: 10px;
+    padding-top: 14px;
   }
 
-  .mon-row :global(.route-select) {
-    max-width: 230px;
-  }
-
-  .mon-spacer {
+  .foot-spacer {
     flex: 1;
   }
 
-  .mon-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 5px 4px 9px;
+  .ghost {
     border: 1px solid var(--border);
-    border-radius: 999px;
-    background: var(--block-sunk);
-    font-size: 12px;
-    color: var(--text);
-    max-width: 320px;
-  }
-
-  .mon-chip.drifted {
-    border-color: var(--warn-border);
-    background: var(--warn-soft);
-  }
-
-  .mon-ic {
-    color: var(--src-monitor);
-    flex: none;
-  }
-
-  .chip-drift {
-    font-size: 9.5px;
-    font-weight: 700;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    color: var(--warn);
-  }
-
-  .chip-x {
-    flex: none;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 18px;
-    height: 18px;
-    padding: 0;
-    border: none;
-    border-radius: 50%;
     background: transparent;
-    color: var(--text-faint);
+    color: var(--text-dim);
+    font-size: 11.5px;
+    padding: 4px 10px;
   }
 
-  .chip-x:hover:not(:disabled) {
-    background: var(--danger-soft);
-    color: var(--danger);
-    border: none;
+  .ghost:hover:not(:disabled) {
+    background: var(--block);
   }
 </style>

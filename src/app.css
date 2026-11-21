@@ -27,6 +27,8 @@
   --src-capture-soft: #e4edf8;
   --src-monitor: #7b53b8;
   --src-monitor-soft: #efe9f9;
+  /* Patchbay wires + port rings — the Loopback teal. */
+  --wire: #17a398;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono",
     monospace;
   --sans:
