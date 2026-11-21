@@ -83,7 +83,7 @@ Chosen: **A**, for coverage-to-complexity ratio.
 
 | Fio concept | Implementation |
 |---|---|
-| Virtual device | `module-null-sink` with `sink_name`, `source_name`, and `sink_properties`/`source_properties` `device.description` set to the device name. The monitor source IS the virtual mic — one module = both ends, matching Loopback's model. |
+| Virtual device | `module-null-sink` with `sink_name` and `sink_properties` `device.description` set to the device name. The monitor source IS the virtual mic — one module = both ends, matching Loopback's model. Note: pipewire-pulse ignores `source_name`/`source_properties` — the monitor is always named `<sink_name>.monitor` (verified on PipeWire 1.6.x). |
 | App → device | `move_sink_input_by_index` for live streams; a saved rule keyed on the stream's `application.name`/`media.name` re-applied on `NEW` sink-input events. |
 | Physical capture → target | `module-loopback source=<src> sink=<dst>` (with `latency_msec`, `dont_move` flags as needed). Each loaded instance is one link; N links = N module instances. |
 | Device → physical output (monitor) | `module-loopback` from `<vdev sink>.monitor` to the output sink. Same mechanism, different endpoints. |
