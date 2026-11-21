@@ -10,6 +10,7 @@
 //! `Mutex` and applies `unsafe impl Send`, giving a `Send + Sync` engine the
 //! Tauri command layer can call from any thread.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -24,6 +25,7 @@ use libpulse_binding::def;
 use libpulse_binding::mainloop::api::MainloopInnerType;
 use libpulse_binding::mainloop::threaded::Mainloop;
 
+use super::levels::Meter;
 use super::types::{ActualState, ModuleInfo, SinkInfo, SourceInfo, StreamInfo};
 
 /// How long [`PulseEngine::start`] waits for the context to reach `Ready`
@@ -108,11 +110,18 @@ impl fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
-struct Inner {
-    /// Field order matters: `context` drops first so it can disconnect while
-    /// the (stopped) `mainloop` handle is still alive.
-    context: Context,
-    mainloop: Mainloop,
+/// `pub(crate)` so the peak-meter facility in `super::levels` (an `impl
+/// PulseEngine` block there) can work the same lock discipline — `inner`
+/// mutex first, then `PaLock`, never the reverse.
+pub(crate) struct Inner {
+    /// Attached peak-detect record streams, keyed by meter endpoint
+    /// (`src:{name}` / `in:{index}`). Declared first so streams unref
+    /// before the context they belong to (fields drop in order).
+    pub(crate) meters: HashMap<String, Meter>,
+    /// Field order matters: `context` drops before `mainloop` so it can
+    /// disconnect while the (stopped) mainloop handle is still alive.
+    pub(crate) context: Context,
+    pub(crate) mainloop: Mainloop,
 }
 
 // SAFETY: `Inner` is only ever touched behind `PulseEngine`'s `Mutex`, or in
@@ -143,10 +152,10 @@ unsafe impl Send for Inner {}
 /// is held, `Drop` still runs `pa_threaded_mainloop_unlock`. Without that, a
 /// panic inside the locked section would leak the C mutex and deadlock
 /// `PulseEngine::drop` running later on another thread.
-struct PaLock(*mut libpulse_binding::mainloop::threaded::MainloopInternal);
+pub(crate) struct PaLock(*mut libpulse_binding::mainloop::threaded::MainloopInternal);
 
 impl PaLock {
-    fn acquire(mainloop: &mut Mainloop) -> Self {
+    pub(crate) fn acquire(mainloop: &mut Mainloop) -> Self {
         let tml = mainloop._inner.get_ptr();
         // SAFETY: `tml` is a live threaded mainloop; `lock` may be called
         // from any thread except the loop thread itself (never us — callers
@@ -197,7 +206,9 @@ pub enum PulseEvent {
 /// `Send + Sync`: intended to sit in Tauri state and be called from command
 /// handler threads.
 pub struct PulseEngine {
-    inner: Mutex<Inner>,
+    /// `pub(crate)` for the `impl PulseEngine` meter methods in
+    /// `super::levels` — same lock discipline as every method here.
+    pub(crate) inner: Mutex<Inner>,
 }
 
 impl PulseEngine {
@@ -224,7 +235,11 @@ impl PulseEngine {
         }
 
         Ok(Self {
-            inner: Mutex::new(Inner { context, mainloop }),
+            inner: Mutex::new(Inner {
+                meters: HashMap::new(),
+                context,
+                mainloop,
+            }),
         })
     }
 
@@ -668,6 +683,13 @@ impl Drop for PulseEngine {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
         {
             let _pa_lock = PaLock::acquire(&mut inner.mainloop);
+            // Disconnect live meter streams first so the server stops
+            // feeding them before the context goes away; dropping the
+            // map then only unrefs.
+            for meter in inner.meters.values_mut() {
+                let _ = meter.stream.disconnect();
+            }
+            inner.meters.clear();
             inner.context.disconnect();
         }
         inner.mainloop.stop();

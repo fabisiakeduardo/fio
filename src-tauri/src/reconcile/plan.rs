@@ -226,13 +226,13 @@ fn sink_name(device: &VirtualDevice) -> String {
 
 /// Our name for a device's mic source — the monitor pipewire-pulse
 /// creates for its sink.
-fn monitor_name(device: &VirtualDevice) -> String {
+pub(crate) fn monitor_name(device: &VirtualDevice) -> String {
     format!("{}.monitor", sink_name(device))
 }
 
 /// The sink name a target points at, computable purely from desired
 /// state. `None` when a `VirtualDevice` id references a deleted device.
-fn target_name(desired: &PersistedState, target: &RouteTarget) -> Option<String> {
+pub(crate) fn target_name(desired: &PersistedState, target: &RouteTarget) -> Option<String> {
     match target {
         RouteTarget::VirtualDevice(id) => {
             desired.devices.iter().find(|d| &d.id == id).map(sink_name)

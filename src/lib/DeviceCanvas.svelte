@@ -13,7 +13,12 @@
   import type { Attachment } from "svelte/attachments";
   import AddSource from "./AddSource.svelte";
   import RouteForm from "./RouteForm.svelte";
-  import { createRoute, deleteRoute, setDefaultMic } from "./fio.svelte";
+  import {
+    createRoute,
+    deleteRoute,
+    levelOf,
+    setDefaultMic,
+  } from "./fio.svelte";
   import { kindLabel, sourceAccent, sourceKind } from "./accents";
   import {
     deviceDrifted,
@@ -22,6 +27,7 @@
     sinkName,
     sourceLabel,
     targetLabel,
+    targetSinkName,
     type RouteTarget,
     type UiState,
     type VirtualDevice,
@@ -40,6 +46,9 @@
   const monitor = $derived(monitorName(device));
   const isDefaultMic = $derived(ui.default_source === monitor);
   const missing = $derived(deviceDrifted(ui, device.id));
+
+  /** Device output level — the `fio-{slug}.monitor` peak. */
+  const outLevel = $derived(levelOf(`dev:${device.id}`));
 
   const routesIn = $derived(
     ui.routes.filter(
@@ -198,6 +207,7 @@
         {@const accent = sourceAccent(r.source)}
         {@const kind = sourceKind(r.source)}
         {@const drift = routeDrift(ui, r.id)}
+        {@const lvl = levelOf(`route:${r.id}`)}
         <div
           class="card src"
           class:drifted={drift !== null}
@@ -283,12 +293,16 @@
           </div>
           <div class="ch-row">
             <span class="ch-label">1 (L)</span>
-            <span class="ch-bar"></span>
+            <span class="ch-bar">
+              <span class="ch-fill" style="transform: scaleX({lvl})"></span>
+            </span>
             <span class="port" {@attach port(`s:${r.id}:0`)}></span>
           </div>
           <div class="ch-row">
             <span class="ch-label">2 (R)</span>
-            <span class="ch-bar"></span>
+            <span class="ch-bar">
+              <span class="ch-fill" style="transform: scaleX({lvl})"></span>
+            </span>
             <span class="port" {@attach port(`s:${r.id}:1`)}></span>
           </div>
         </div>
@@ -314,13 +328,17 @@
         <div class="ch-row">
           <span class="port" {@attach port("o:in:0")}></span>
           <span class="ch-label">Channel 1 (L)</span>
-          <span class="ch-bar"></span>
+          <span class="ch-bar">
+            <span class="ch-fill" style="transform: scaleX({outLevel})"></span>
+          </span>
           <span class="port" {@attach port("o:out:0")}></span>
         </div>
         <div class="ch-row">
           <span class="port" {@attach port("o:in:1")}></span>
           <span class="ch-label">Channel 2 (R)</span>
-          <span class="ch-bar"></span>
+          <span class="ch-bar">
+            <span class="ch-fill" style="transform: scaleX({outLevel})"></span>
+          </span>
           <span class="port" {@attach port("o:out:1")}></span>
         </div>
       </div>
@@ -381,6 +399,8 @@
       {#if !monHidden}
         {#each monitorRoutes as r (r.id)}
           {@const drift = routeDrift(ui, r.id)}
+          {@const tSink = targetSinkName(r.target, ui)}
+          {@const mlvl = tSink ? levelOf(`mon:${tSink}`) : 0}
           <div class="card mon" class:drifted={drift !== null}>
             <div class="card-head">
               <span class="mon-ic" aria-hidden="true">
@@ -421,12 +441,16 @@
             <div class="ch-row">
               <span class="port" {@attach port(`m:${r.id}:0`)}></span>
               <span class="ch-label">Channel 1 (L)</span>
-              <span class="ch-bar"></span>
+              <span class="ch-bar">
+                <span class="ch-fill" style="transform: scaleX({mlvl})"></span>
+              </span>
             </div>
             <div class="ch-row">
               <span class="port" {@attach port(`m:${r.id}:1`)}></span>
               <span class="ch-label">Channel 2 (R)</span>
-              <span class="ch-bar"></span>
+              <span class="ch-bar">
+                <span class="ch-fill" style="transform: scaleX({mlvl})"></span>
+              </span>
             </div>
           </div>
         {:else}
@@ -715,9 +739,22 @@
 
   .ch-bar {
     flex: 1;
-    height: 2px;
-    border-radius: 1px;
-    background: #e2dfd8;
+    position: relative;
+    height: 3px;
+    border-radius: 2px;
+    background: #ddd9cf;
+    overflow: hidden;
+  }
+
+  /* Slim VU fill — scaleX keeps updates off the layout path at ~8 Hz. */
+  .ch-fill {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--wire);
+    transform: scaleX(0);
+    transform-origin: left center;
+    transition: transform 110ms linear;
   }
 
   .port {

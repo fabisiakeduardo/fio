@@ -119,9 +119,13 @@ impl Manager {
     /// would tell the UI to re-query `ui_state`. Called once from the
     /// Tauri setup hook.
     pub fn set_app_handle(&self, app: &AppHandle) {
-        let app = app.clone();
+        let app_notify = app.clone();
         self.driver.set_notify(move || {
-            let _ = app.emit("fio-state-changed", ());
+            let _ = app_notify.emit("fio-state-changed", ());
+        });
+        let app = app.clone();
+        self.driver.set_level_emit(move |levels| {
+            let _ = app.emit("fio-levels", levels);
         });
     }
 

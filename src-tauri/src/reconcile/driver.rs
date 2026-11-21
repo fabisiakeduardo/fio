@@ -24,10 +24,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::audio::{ActualState, EngineError, PulseEngine, PulseEvent};
+use crate::audio::{ActualState, EngineError, MeterTarget, PulseEngine, PulseEvent};
 use crate::model::{PersistedState, Store};
 
-use super::{Action, Drift, detect_drift, plan_new_stream, plan_startup, rule_key};
+use super::{
+    Action, Drift, detect_drift, meter_plan, plan_new_stream, plan_startup, rule_key,
+};
 
 /// How often the event loop recomputes [`detect_drift`] even when no
 /// events arrive — drift surfaces within one tick rather than only on
@@ -43,6 +45,11 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(200);
 /// update memory immediately; the drift tick flushes at this cadence
 /// and [`Driver::drop`] flushes once more, instead of writing per event.
 const SEEN_PERSIST_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the event loop drains peak streams and emits `fio-levels`
+/// — ~8 Hz. Also the `recv_timeout` granularity, so this doubles as the
+/// upper bound on event latency: drift still recomputes only on
+/// [`RECHECK_INTERVAL`].
+const LEVELS_INTERVAL: Duration = Duration::from_millis(120);
 
 /// Shared, swappable handle to the live engine connection: `None` while
 /// the audio server is unreachable.
@@ -53,6 +60,9 @@ const SEEN_PERSIST_INTERVAL: Duration = Duration::from_secs(5);
 /// `Arc` out; the lock is never held across an engine call, so a slow
 /// snapshot can't stall them.
 pub type EngineSlot = Arc<Mutex<Option<Arc<PulseEngine>>>>;
+
+/// The `fio-levels` emitter: `dev:`/`route:`/`mon:` key → peak 0..1.
+type LevelEmit = Arc<dyn Fn(HashMap<String, f32>) + Send + Sync>;
 
 /// Mutable state shared between the driver (command path) and its event
 /// thread. One mutex; critical sections are brief and the engine is never
@@ -73,6 +83,15 @@ struct Shared {
     /// changes the drift tick flushes on [`SEEN_PERSIST_INTERVAL`].
     seen_dirty: bool,
     last_seen_persist: Instant,
+    /// Meter endpoints the engine was asked to attach — endpoint key
+    /// (`src:{name}`/`in:{index}`) → target. Cleared on attach (a fresh
+    /// engine has no streams) and on connection death.
+    attached_meters: HashMap<String, MeterTarget>,
+    /// `fio-levels` key → endpoint key, from the latest [`meter_plan`].
+    meter_keys: HashMap<String, String>,
+    /// Emits `fio-levels` payloads (~8 Hz) — installed from the command
+    /// layer, same pattern as `notify`.
+    level_emit: Option<LevelEmit>,
 }
 
 /// Owns the [`Store`] and the event thread between it and the engine
@@ -103,6 +122,9 @@ impl Driver {
             notify: None,
             seen_dirty: false,
             last_seen_persist: Instant::now(),
+            attached_meters: HashMap::new(),
+            meter_keys: HashMap::new(),
+            level_emit: None,
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread = {
@@ -136,6 +158,16 @@ impl Driver {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .notify = Some(Arc::new(f));
+    }
+
+    /// Installs the `fio-levels` emitter the event thread calls ~8×/s
+    /// with the latest peak map — levels are emitted, never persisted
+    /// or folded into `UiState`, so the `ui_state` contract is untouched.
+    pub fn set_level_emit(&self, f: impl Fn(HashMap<String, f32>) + Send + Sync + 'static) {
+        self.shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .level_emit = Some(Arc::new(f));
     }
 
     /// The latest drift report — recomputed on every module-removal /
@@ -240,17 +272,29 @@ fn event_loop(slot: &EngineSlot, shared: &Mutex<Shared>, shutdown: &AtomicBool) 
     // (launch); on an empty slot it doubles as the first reconnect try.
     let mut conn = attach(slot, shared);
     let mut retry_at = Instant::now() + RECONNECT_BACKOFF;
+    let mut last_drift = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
         match &conn {
             Some(c) => {
-                let result = match c.rx.recv_timeout(RECHECK_INTERVAL) {
+                // The recv timeout is the fast levels tick; drift keeps
+                // its own 1 s cadence via `last_drift`.
+                let result = match c.rx.recv_timeout(LEVELS_INTERVAL) {
                     Ok(PulseEvent::NewSinkInput(index)) => {
                         on_new_sink_input(index, &c.engine, shared)
                     }
                     // RemovedModule and Other: something changed outside
                     // the heal path — report it via drift, never auto-fix.
-                    Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Ok(_) => {
+                        last_drift = Instant::now();
                         update_drift(&c.engine, shared)
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if last_drift.elapsed() >= RECHECK_INTERVAL {
+                            last_drift = Instant::now();
+                            update_drift(&c.engine, shared)
+                        } else {
+                            Ok(())
+                        }
                     }
                     // The subscription's Sender died — only possible if
                     // the engine was dropped or never connected.
@@ -258,6 +302,7 @@ fn event_loop(slot: &EngineSlot, shared: &Mutex<Shared>, shutdown: &AtomicBool) 
                         Err(EngineError::NotReady)
                     }
                 };
+                emit_levels(&c.engine, shared);
                 if let Err(e) = result
                     && is_dead(&e)
                 {
@@ -267,6 +312,7 @@ fn event_loop(slot: &EngineSlot, shared: &Mutex<Shared>, shutdown: &AtomicBool) 
                     clear_slot(slot, &c.engine);
                     conn = None;
                     retry_at = Instant::now() + RECONNECT_BACKOFF;
+                    clear_meters(shared);
                     notify(shared);
                 }
             }
@@ -304,6 +350,14 @@ fn attach(slot: &EngineSlot, shared: &Mutex<Shared>) -> Option<Conn> {
     // slot engine that is fully wired.
     *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&engine));
     let rx = engine.subscribe();
+    {
+        // Any attach is a fresh meter world — even on the rare reused
+        // engine, clearing just makes the next reconcile's `set_meter`
+        // re-check stream liveness (a no-op for live ones).
+        let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+        shared.attached_meters.clear();
+        shared.meter_keys.clear();
+    }
     startup_heal(&engine, shared);
     Some(Conn { engine, rx })
 }
@@ -400,19 +454,83 @@ fn on_new_sink_input(
 /// drift list).
 fn update_drift(engine: &PulseEngine, shared: &Mutex<Shared>) -> Result<(), EngineError> {
     let actual = engine.actual_state()?;
-    let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
-    shared.drift = detect_drift(shared.store.state(), &actual);
-    shared
-        .rescues
-        .retain(|index, _| actual.sink_inputs.iter().any(|s| s.index == *index));
-    // Deferred `seen_apps` persistence: one disk write per interval
-    // rather than per stream event.
-    if shared.seen_dirty && shared.last_seen_persist.elapsed() >= SEEN_PERSIST_INTERVAL {
-        shared.store.flush();
-        shared.seen_dirty = false;
-        shared.last_seen_persist = Instant::now();
+    let (endpoints, removes) = {
+        let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+        shared.drift = detect_drift(shared.store.state(), &actual);
+        shared
+            .rescues
+            .retain(|index, _| actual.sink_inputs.iter().any(|s| s.index == *index));
+        // Deferred `seen_apps` persistence: one disk write per interval
+        // rather than per stream event.
+        if shared.seen_dirty && shared.last_seen_persist.elapsed() >= SEEN_PERSIST_INTERVAL {
+            shared.store.flush();
+            shared.seen_dirty = false;
+            shared.last_seen_persist = Instant::now();
+        }
+        // Reconcile the meter set against the same snapshot: endpoints
+        // no longer planned are removed below; everything planned is
+        // (re)applied — `set_meter` no-ops on live same-target streams
+        // and recreates dead ones.
+        let plan = meter_plan(shared.store.state(), &actual);
+        let removes: Vec<String> = shared
+            .attached_meters
+            .keys()
+            .filter(|k| !plan.endpoints.contains_key(*k))
+            .cloned()
+            .collect();
+        shared.attached_meters = plan.endpoints.clone();
+        shared.meter_keys = plan.ui_keys;
+        (plan.endpoints, removes)
+    };
+    // Engine calls after the shared lock is released — ops must never
+    // run under it.
+    for key in removes {
+        engine.remove_meter(&key);
+    }
+    for (key, target) in endpoints {
+        engine.set_meter(&key, &target);
     }
     Ok(())
+}
+
+/// Drains the engine's peak cache and fires the installed `fio-levels`
+/// emitter with the `dev:`/`route:`/`mon:` payload. Runs on every
+/// [`LEVELS_INTERVAL`] tick while a connection lives. Peaks for keys
+/// whose endpoint never attached surface as 0 via the missing-`get`
+/// fallback — the payload still names every planned UI key so the UI
+/// can rely on key presence rather than guessing.
+fn emit_levels(engine: &PulseEngine, shared: &Mutex<Shared>) {
+    let peaks = engine.peaks();
+    let work = {
+        let shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+        shared.level_emit.clone().map(|emit| {
+            let payload: HashMap<String, f32> = shared
+                .meter_keys
+                .iter()
+                .map(|(ui_key, ep)| (ui_key.clone(), peaks.get(ep).copied().unwrap_or(0.0)))
+                .collect();
+            (emit, payload)
+        })
+    };
+    // Callback runs outside the shared lock — it emits over IPC.
+    if let Some((emit, payload)) = work {
+        emit(payload);
+    }
+}
+
+/// Clears meter bookkeeping and flattens the UI when the connection
+/// dies — the dead engine's streams went with it, and stale keys would
+/// otherwise freeze the last readings on screen.
+fn clear_meters(shared: &Mutex<Shared>) {
+    let emit = {
+        let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+        shared.attached_meters.clear();
+        shared.meter_keys.clear();
+        shared.level_emit.clone()
+    };
+    if let Some(emit) = emit {
+        emit(HashMap::new());
+    }
 }
 
 /// Executes one [`Action`]; shared between [`Driver::apply`] (command

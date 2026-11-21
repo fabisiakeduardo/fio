@@ -10,7 +10,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { RouteSource, RouteTarget, UiState } from "./types";
-import { monitorName } from "./types";
+import { monitorName, targetSinkName } from "./types";
 
 const inTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -20,7 +20,16 @@ export const fio = $state({
   loading: true,
   /** Last backend error message, shown in the toast. */
   error: null as string | null,
+  /**
+   * Latest `fio-levels` payload (~8 Hz): `dev:{id}` device output,
+   * `route:{id}` route audio, `mon:{sink}` monitor-feed destination —
+   * each 0..1. Missing keys render flat via {@link levelOf}.
+   */
+  levels: {} as Record<string, number>,
 });
+
+/** Current meter reading for an `fio-levels` key — 0 when unmetered. */
+export const levelOf = (key: string): number => fio.levels[key] ?? 0;
 
 /* ------- browser-dev mock ------- */
 
@@ -158,18 +167,67 @@ export async function refresh(): Promise<void> {
 }
 
 let unlisten: UnlistenFn | null = null;
+let unlistenLevels: UnlistenFn | null = null;
+let mockLevelTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Browser-mock levels: sine-ish waves per visible key so the dev-server
+ * demo shows the meters moving without a server.
+ */
+function startMockLevels(): void {
+  let t = 0;
+  mockLevelTimer = setInterval(() => {
+    t += 0.12;
+    const ui = mock;
+    if (!ui) return;
+    const wave = (f: number, phase: number, base = 0.55) =>
+      Math.max(
+        0,
+        Math.min(
+          1,
+          base +
+            0.35 * Math.sin(t * f + phase) +
+            0.08 * Math.sin(t * f * 2.7 + phase * 1.3),
+        ),
+      );
+    const levels: Record<string, number> = {};
+    ui.devices.forEach((d, i) => {
+      levels[`dev:${d.id}`] = wave(0.9 + i * 0.5, i * 1.7);
+    });
+    ui.routes.forEach((r, i) => {
+      levels[`route:${r.id}`] = wave(1.4 + i * 0.45, i * 2.3, 0.45);
+      if ("VirtualMonitor" in r.source) {
+        const sink = targetSinkName(r.target, ui);
+        if (sink) levels[`mon:${sink}`] = wave(0.7 + i * 0.3, i * 1.1);
+      }
+    });
+    fio.levels = levels;
+  }, 120);
+}
 
 export async function start(): Promise<void> {
   await refresh();
-  if (!inTauri) return;
+  if (!inTauri) {
+    startMockLevels();
+    return;
+  }
   unlisten = await listen("fio-state-changed", () => {
     void refresh();
+  });
+  unlistenLevels = await listen<Record<string, number>>("fio-levels", (e) => {
+    fio.levels = e.payload;
   });
 }
 
 export function stop(): void {
   unlisten?.();
   unlisten = null;
+  unlistenLevels?.();
+  unlistenLevels = null;
+  if (mockLevelTimer) {
+    clearInterval(mockLevelTimer);
+    mockLevelTimer = null;
+  }
 }
 
 /**

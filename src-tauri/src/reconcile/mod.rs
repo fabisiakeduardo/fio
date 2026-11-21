@@ -7,9 +7,12 @@
 //! a plan returns and surfaces the [`Drift`] flags to the UI.
 
 mod driver;
+mod meters;
 mod plan;
 
 pub use driver::{Driver, EngineSlot};
+pub use meters::{MeterPlan, meter_plan};
+pub(crate) use plan::{monitor_name, target_name};
 pub use plan::{
     Action, Drift, detect_drift, link_names, link_present, plan_new_stream, plan_startup, rule_key,
 };

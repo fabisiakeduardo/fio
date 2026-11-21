@@ -34,13 +34,23 @@ pub struct Pacat(Option<Child>);
 
 impl Pacat {
     pub fn spawn() -> Self {
+        Self::spawn_file("/dev/zero")
+    }
+
+    /// `/dev/urandom` as PCM is full-scale noise — a non-zero signal for
+    /// the peak-meter tests, where `/dev/zero` would read flat.
+    pub fn spawn_noise() -> Self {
+        Self::spawn_file("/dev/urandom")
+    }
+
+    fn spawn_file(path: &str) -> Self {
         let child = Command::new("pacat")
             .args([
                 "--playback",
                 "--format=s16le",
                 "--rate=48000",
                 "--channels=2",
-                "/dev/zero",
+                path,
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())

@@ -67,6 +67,13 @@ export interface UiState {
 
 export const sinkName = (d: VirtualDevice): string => `fio-${d.slug}`;
 export const monitorName = (d: VirtualDevice): string => `${sinkName(d)}.monitor`;
+
+/** Sink name a route target resolves to — `null` for deleted devices. */
+export function targetSinkName(target: RouteTarget, ui: UiState): string | null {
+  if ("PhysicalSink" in target) return target.PhysicalSink;
+  const d = ui.devices.find((d) => d.id === target.VirtualDevice);
+  return d ? sinkName(d) : null;
+}
 export const isVirtualSinkName = (name: string): boolean => name.startsWith("fio-");
 
 /** Rule key a stream matches against: application.name, else media.name. */
