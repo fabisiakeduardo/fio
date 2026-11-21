@@ -161,9 +161,7 @@
       aria-hidden="true"
     >
       {#each wires as w (w.key)}
-        <path d={w.d} fill="none" stroke="var(--wire)" stroke-width="1.8" />
-        <circle cx={w.x1} cy={w.y1} r="2.4" fill="var(--wire)" />
-        <circle cx={w.x2} cy={w.y2} r="2.4" fill="var(--wire)" />
+        <path d={w.d} fill="none" stroke="var(--wire)" stroke-width="1.6" />
       {/each}
     </svg>
 
@@ -532,6 +530,13 @@
     overflow: visible;
   }
 
+  @media (max-width: 860px) {
+    .patch {
+      grid-template-columns: minmax(0, 1fr);
+      row-gap: 22px;
+    }
+  }
+
   .col {
     display: flex;
     flex-direction: column;
@@ -620,10 +625,8 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 26px;
-    height: 26px;
-    border-radius: 7px;
-    background: var(--as);
+    width: 18px;
+    height: 18px;
     color: var(--a);
   }
 
@@ -632,10 +635,8 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 26px;
-    height: 26px;
-    border-radius: 7px;
-    background: var(--src-monitor-soft);
+    width: 18px;
+    height: 18px;
     color: var(--src-monitor);
   }
 
@@ -714,9 +715,9 @@
 
   .ch-bar {
     flex: 1;
-    height: 7px;
-    border-radius: 4px;
-    background: var(--border-soft);
+    height: 2px;
+    border-radius: 1px;
+    background: #e2dfd8;
   }
 
   .port {

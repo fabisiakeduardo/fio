@@ -283,19 +283,13 @@
 
   .dev-icon {
     flex: none;
-    width: 22px;
-    height: 22px;
-    padding: 4px;
-    border-radius: 6px;
-    background: var(--block);
-    border: 1px solid var(--border-soft);
+    width: 15px;
+    height: 15px;
     color: var(--text-faint);
   }
 
   .row.sel .dev-icon {
     color: var(--accent);
-    background: var(--accent-soft);
-    border-color: var(--accent-ring);
   }
 
   .row-text {

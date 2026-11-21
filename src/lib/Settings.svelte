@@ -56,8 +56,7 @@
     launch at login
   </label>
   <span class="foot-hint">
-    closing the window keeps fio in the tray — quit from the tray icon;
-    your devices keep working
+    closing this window keeps fio running in the tray
   </span>
 </footer>
 
